@@ -1,0 +1,71 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: taskmate
+      POSTGRES_USER: taskmate
+      POSTGRES_PASSWORD: taskmate
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskmate"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.47
+    environment:
+      AWS_ACCESS_KEY_ID: taskmate
+      AWS_SECRET_ACCESS_KEY: taskmate-local-secret
+      S3_BUCKET: taskmate
+    ports:
+      - "9000:8333"
+    volumes:
+      - seaweedfs_data:/data
+
+  api:
+    build: .
+    env_file: .env
+    ports:
+      - "8001:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_started
+    command: ["sh", "-c", "python -m app.integrations.storage && alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+
+  worker:
+    build: .
+    env_file: .env
+    depends_on:
+      api:
+        condition: service_started
+    command: ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=INFO"]
+
+  scheduler:
+    build: .
+    env_file: .env
+    depends_on:
+      api:
+        condition: service_started
+    command: ["celery", "-A", "app.workers.celery_app:celery_app", "beat", "--loglevel=INFO"]
+
+volumes:
+  postgres_data:
+  redis_data:
+  seaweedfs_data:

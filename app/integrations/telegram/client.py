@@ -1,0 +1,77 @@
+import httpx
+
+from app.core.config import get_settings
+from app.core.errors import AppError
+
+
+class TelegramClient:
+    def __init__(self, token: str | None = None):
+        self.token = token if token is not None else get_settings().telegram_bot_token
+        self.base_url = f"https://api.telegram.org/bot{self.token}"
+
+    def _call(self, method: str, payload: dict):
+        if not self.token:
+            return None
+        response = httpx.post(f"{self.base_url}/{method}", json=payload, timeout=10)
+        response.raise_for_status()
+        body = response.json()
+        return body.get("result") if body.get("ok") else None
+
+    def send_message(self, chat_id: int, text: str, reply_markup: dict | None = None):
+        payload = {"chat_id": chat_id, "text": text}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        return self._call("sendMessage", payload)
+
+    def edit_message(
+        self, chat_id: int, message_id: int, text: str, reply_markup: dict | None = None
+    ):
+        payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        return self._call("editMessageText", payload)
+
+    def answer_callback(self, callback_id: str | None, text: str = ""):
+        if not callback_id:
+            return None
+        return self._call("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+
+    def get_chat_member(self, chat_id: int, user_id: int):
+        return self._call("getChatMember", {"chat_id": chat_id, "user_id": user_id})
+
+    def download_file(self, file_id: str, max_bytes: int) -> bytes:
+        info = self._call("getFile", {"file_id": file_id})
+        if not info or not info.get("file_path"):
+            raise AppError("TELEGRAM_FILE_ERROR", "Telegram file unavailable", 502)
+        chunks = bytearray()
+        url = f"https://api.telegram.org/file/bot{self.token}/{info['file_path']}"
+        try:
+            with httpx.stream("GET", url, timeout=30) as response:
+                response.raise_for_status()
+                for chunk in response.iter_bytes():
+                    chunks.extend(chunk)
+                    if len(chunks) > max_bytes:
+                        raise AppError("VOICE_TOO_LARGE", "Voice message is too large", 413)
+        except httpx.HTTPError as exc:
+            raise AppError("TELEGRAM_FILE_ERROR", "Telegram file download failed", 502) from exc
+        return bytes(chunks)
+
+
+def main_menu(tokens: dict[str, str]):
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "Сегодня", "callback_data": tokens["today"]},
+                {"text": "Задачи", "callback_data": tokens["tasks"]},
+            ],
+            [
+                {"text": "Проекты", "callback_data": tokens["projects"]},
+                {"text": "Inbox", "callback_data": tokens["inbox"]},
+            ],
+            [
+                {"text": "Источники", "callback_data": tokens["sources"]},
+                {"text": "Календарь", "callback_data": tokens["schedule"]},
+            ],
+            [{"text": "Настройки", "callback_data": tokens["settings"]}],
+        ]
+    }
