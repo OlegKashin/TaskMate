@@ -14,6 +14,7 @@ from app.models.entities import (
     InboxItem,
     Message,
     Notification,
+    Source,
     Task,
     User,
 )
@@ -88,6 +89,13 @@ class AIActionService:
     def apply(self, user: User, result: AIResult, message: Message | None = None):
         if result.confidence < 0.60:
             return {"state": "clarification", "reason": result.reason}
+        if result.intent == "create_event" and not result.entities.get("connection_id"):
+            active_calendar = self.db.scalar(select(CalendarConnection.id).where(
+                CalendarConnection.user_id == user.id,
+                CalendarConnection.status == "active",
+            ))
+            if not active_calendar:
+                return {"state": "calendar_not_connected"}
         if result.intent == "reply_email":
             from app.services.domain import UIActionService
 
@@ -95,7 +103,7 @@ class AIActionService:
                 "result": result.model_dump(mode="json"),
                 "message_id": str(message.id) if message else None,
             })
-            return {"state": "proposal", "confidence": "high", "token": token,
+            return {"state": "proposal", "confidence": "high" if result.confidence >= 0.85 else "medium", "token": token,
                     "intent": result.intent, "entities": result.entities, "reason": result.reason}
         if result.intent in MUTATING_INTENTS:
             from app.services.domain import UIActionService
@@ -246,6 +254,8 @@ class AIActionService:
                     CalendarConnection.user_id == user.id,
                     CalendarConnection.status == "active",
                 ).limit(2)).all()
+                if not connections:
+                    return {"state": "calendar_not_connected"}
                 if len(connections) != 1:
                     return {"state": "clarification", "reason": "Выберите подключённый календарь"}
                 connection_id = connections[0].id
@@ -298,13 +308,53 @@ class AIService:
                 from app.ai.transcription import VoiceTranscriber
 
                 message.text = await VoiceTranscriber().transcribe(message)
-            result = await self.provider.interpret(message.text or message.subject or "")
+            input_text = message.text or message.subject or ""
+            if message.message_type == "email":
+                input_text = (
+                    f"Email message_id: {message.id}\n"
+                    f"From: {message.sender_email or ''}\n"
+                    f"Subject: {message.subject or ''}\n"
+                    f"Body:\n{input_text}"
+                )
+            result = await self.provider.interpret(input_text)
             outcome = AIActionService(self.db).apply(user, result, message)
             job.result, job.status, message.processing_status = (
                 {"ai": result.model_dump(mode="json"), "outcome": outcome},
                 "completed",
                 "processed",
             )
+            inferred_types = {
+                "create_task": "task_candidate",
+                "reply_email": "reply_required",
+                "create_waiting_for": "waiting_for",
+                "create_event": "meeting",
+            }
+            inferred_type = inferred_types.get(result.intent) if outcome.get("state") in {
+                "proposal", "calendar_not_connected",
+            } else None
+            if inferred_type:
+                self.db.add(
+                    InboxItem(
+                        user_id=user.id,
+                        message_id=message.id,
+                        item_type=inferred_type,
+                        status="proposed",
+                        title=message.subject or result.entities.get("title"),
+                        summary=message.text,
+                    )
+                )
+            if outcome.get("state") == "clarification" and not result.inbox_classification:
+                source = self.db.get(Source, message.source_id)
+                if source and source.type in {"gmail", "yandex", "mailru", "imap"}:
+                    self.db.add(InboxItem(
+                        user_id=user.id, message_id=message.id, item_type="question",
+                        title=message.subject or "Нужно уточнение", summary=result.reason,
+                    ))
+                    self.db.add(Notification(
+                        user_id=user.id, type="clarification_needed",
+                        payload={"title": f"Нужно уточнить письмо «{message.subject or 'без темы'}» в Inbox."},
+                        dedupe_key=f"clarify:{message.id}",
+                    ))
             if result.inbox_classification:
                 classification = result.inbox_classification
                 self.db.add(

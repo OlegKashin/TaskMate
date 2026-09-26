@@ -20,6 +20,13 @@ def outcome_message(db: Session, user: User, outcome: dict) -> tuple[str, dict |
             {"text": "Изменить текст", "callback_data": edit},
             {"text": "Отмена", "callback_data": cancel},
         ]]})
+    if state == "calendar_not_connected":
+        connect = UIActionService(db).create(user, "connect_provider", {"provider": "google"})
+        cancel = UIActionService(db).create(user, "cancel_ai", {})
+        return "Чтобы создавать события, подключите Google Calendar.", {"inline_keyboard": [[
+            {"text": "Подключить", "callback_data": connect},
+            {"text": "Отмена", "callback_data": cancel},
+        ]]}
     if state == "proposal":
         entities = outcome.get("entities", {})
         title = entities.get("title") or entities.get("target") or outcome["intent"]

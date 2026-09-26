@@ -9,11 +9,18 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.errors import AppError, conflict
 from app.core.security import SecretBox
-from app.integrations.email import gmail_messages, imap_messages, send_reply
+from app.integrations.email import (
+    gmail_folders,
+    gmail_messages,
+    imap_folders,
+    imap_messages,
+    send_reply,
+)
 from app.integrations.storage import S3Storage
 from app.models.entities import (
     Attachment,
     Message,
+    Notification,
     Source,
     SourceCredential,
     SourceFolder,
@@ -38,6 +45,16 @@ class EmailService:
             raise conflict("SOURCE_INACTIVE", "Mailbox is not active")
         return source
 
+    def _mark_auth_error(self, source: Source) -> None:
+        if source.status == "error":
+            return
+        source.status = "error"
+        self.db.add(Notification(
+            user_id=source.user_id, type="source_error",
+            payload={"title": f"Почта «{source.name}» требует повторного подключения."},
+        ))
+        self.db.commit()
+
     def _credentials(self, source: Source) -> tuple[str, str, bool]:
         credential = self.db.scalar(
             select(SourceCredential).where(SourceCredential.source_id == source.id)
@@ -60,7 +77,12 @@ class EmailService:
         if oauth and expiry and expiry <= utcnow():
             from app.services.oauth import OAuthService
 
-            OAuthService(self.db).refresh_source(source, credential)
+            try:
+                OAuthService(self.db).refresh_source(source, credential)
+            except AppError as exc:
+                if exc.code == "MAIL_REAUTH_REQUIRED":
+                    self._mark_auth_error(source)
+                raise
             secret_value = credential.encrypted_access_token
         return username, box.decrypt(secret_value), oauth
 
@@ -120,19 +142,24 @@ class EmailService:
             )
         )
         selected = [folder.external_folder_id for folder in folders]
-        if source.type == "gmail":
-            records = gmail_messages(secret, since, selected or ["INBOX"])
-        else:
-            settings = get_settings()
-            records = imap_messages(
-                source.type,
-                username,
-                secret,
-                since,
-                selected,
-                oauth=oauth,
-                host=settings.imap_host if source.type == "imap" else None,
-            )
+        try:
+            if source.type == "gmail":
+                records = gmail_messages(secret, since, selected or ["INBOX"])
+            else:
+                settings = get_settings()
+                records = imap_messages(
+                    source.type,
+                    username,
+                    secret,
+                    since,
+                    selected,
+                    oauth=oauth,
+                    host=settings.imap_host if source.type == "imap" else None,
+                )
+        except AppError as exc:
+            if exc.code == "MAIL_REAUTH_REQUIRED":
+                self._mark_auth_error(source)
+            raise
         count = 0
         for record in records:
             if self.db.scalar(
@@ -184,6 +211,40 @@ class EmailService:
         source.last_synced_at = sync_started_at
         self.db.commit()
         return count
+
+    def discover_folders(self, user: User, source_id: uuid.UUID) -> list[SourceFolder]:
+        source = self._source(user, source_id)
+        username, secret, oauth = self._credentials(source)
+        try:
+            if source.type == "gmail":
+                available = gmail_folders(secret)
+            else:
+                available = imap_folders(
+                    source.type, username, secret, oauth=oauth,
+                    host=get_settings().imap_host if source.type == "imap" else None,
+                )
+        except AppError as exc:
+            if exc.code == "MAIL_REAUTH_REQUIRED":
+                self._mark_auth_error(source)
+            raise
+        existing = {
+            folder.external_folder_id: folder
+            for folder in self.db.scalars(
+                select(SourceFolder).where(SourceFolder.source_id == source.id)
+            )
+        }
+        for folder_id, name in available:
+            if folder_id in existing:
+                existing[folder_id].name = name
+            else:
+                folder = SourceFolder(
+                    source_id=source.id, external_folder_id=folder_id,
+                    name=name, is_selected=folder_id.upper() == "INBOX",
+                )
+                self.db.add(folder)
+                existing[folder_id] = folder
+        self.db.commit()
+        return sorted(existing.values(), key=lambda item: (not item.is_selected, item.name.lower()))
 
     def confirm_reply(self, user: User, token: str) -> str:
         action = UIActionService(self.db).consume(user, token, "send_email")

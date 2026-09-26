@@ -363,6 +363,7 @@ def test_bot_email_connect_menu_and_authorize_link(client, db, monkeypatch):
         "Яндекс.Почта",
         "Mail.ru",
         "Другой IMAP",
+        "Google Calendar",
     }
     gmail_token = buttons[0][0]["callback_data"]
     callback = client.post(

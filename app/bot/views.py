@@ -1,0 +1,156 @@
+"""Small Telegram cards backed by short-lived, owner-bound callback actions."""
+
+import uuid
+
+from sqlalchemy import select
+
+from app.ai.service import MUTATING_INTENTS
+from app.bot.presentation import section_message
+from app.models.entities import (
+    AIProcessingJob,
+    CalendarEvent,
+    InboxItem,
+    Message,
+    Project,
+    Source,
+    Task,
+    UserSettings,
+)
+from app.schemas.domain import AIResult
+from app.services.domain import UIActionService
+
+
+def _button(db, user, label: str, action: str, payload: dict) -> dict:
+    return {"text": label, "callback_data": UIActionService(db).create(user, action, payload)}
+
+
+def section_view(db, user, section: str) -> tuple[str, dict | None]:
+    text = section_message(db, user, section)
+    if section == "settings":
+        settings = db.get(UserSettings, user.id)
+        rows = [
+            [_button(db, user, "Утренняя сводка вкл/выкл", "setting_toggle", {"field": "morning_briefing_enabled"})],
+            [_button(db, user, "Вечерняя статистика вкл/выкл", "setting_toggle", {"field": "evening_stats_enabled"})],
+            [_button(db, user, "Погода вкл/выкл", "setting_toggle", {"field": "weather_enabled"})],
+            [_button(db, user, "Время сводок", "setting_times", {})],
+            [_button(db, user, "Проект по умолчанию", "setting_projects", {})],
+        ]
+        default_project = db.get(Project, settings.default_project_id) if settings.default_project_id else None
+        text += (f"\nПогода: {'вкл' if settings.weather_enabled else 'выкл'}"
+                 f"\nПроект по умолчанию: {default_project.name if default_project else 'Inbox'}"
+                 "\nЧасовой пояс: /timezone Europe/Moscow")
+        return text, {"inline_keyboard": rows}
+    model = {"tasks": Task, "projects": Project, "inbox": InboxItem,
+             "sources": Source, "schedule": CalendarEvent}.get(section)
+    if model is None:
+        return text, None
+    query = select(model).where(model.user_id == user.id)
+    if model is Task:
+        query = query.where(Task.deleted_at.is_(None))
+    if model is InboxItem:
+        query = query.where(InboxItem.status.in_(["new", "proposed", "snoozed"]))
+    if model is CalendarEvent:
+        query = query.where(CalendarEvent.status != "cancelled").order_by(CalendarEvent.start_at)
+    else:
+        query = query.order_by(model.created_at.desc())
+    items = db.scalars(query.limit(10)).all()
+    rows = [[_button(db, user, str(getattr(item, "title", None) or getattr(item, "name", None) or item.id)[:40],
+                     f"{section}_open", {"id": str(item.id)})] for item in items]
+    return text, {"inline_keyboard": rows} if rows else None
+
+
+def inbox_view(db, user, item_id: uuid.UUID) -> tuple[str, dict]:
+    item = db.get(InboxItem, item_id)
+    if not item or item.user_id != user.id:
+        return "Элемент Inbox не найден.", {"inline_keyboard": []}
+    message = db.get(Message, item.message_id) if item.message_id else None
+    text = f"📥 {item.title or item.item_type}\n{item.summary or ''}\nСтатус: {item.status}"
+    rows = []
+    if message:
+        job = db.scalar(select(AIProcessingJob).where(
+            AIProcessingJob.message_id == message.id,
+            AIProcessingJob.status == "completed",
+        ).order_by(AIProcessingJob.created_at.desc()))
+        if job and job.result and job.result.get("ai"):
+            result = AIResult.model_validate(job.result["ai"])
+            if job.result.get("outcome", {}).get("state") == "calendar_not_connected":
+                text += "\nДля события нужен Google Calendar."
+                rows.append([_button(db, user, "Подключить Calendar", "connect_provider", {
+                    "provider": "google",
+                })])
+            elif result.intent in MUTATING_INTENTS and result.confidence >= 0.60:
+                rows.append([_button(db, user, "Подтвердить предложение", "confirm_ai", {
+                    "result": result.model_dump(mode="json"), "message_id": str(message.id),
+                })])
+            elif result.confidence < 0.60:
+                text += f"\nУточните: {result.reason}"
+                rows.append([_button(db, user, "Уточнить", "inbox_action", {
+                    "id": str(item.id), "operation": "clarify",
+                })])
+    actions = [
+        _button(db, user, "Создать задачу", "inbox_action", {"id": str(item.id), "operation": "create_task"}),
+        _button(db, user, "Отложить на день", "inbox_action", {"id": str(item.id), "operation": "snooze"}),
+    ]
+    rows.append(actions)
+    if message and message.message_type == "email":
+        rows.append([_button(db, user, "Ответить", "inbox_action", {"id": str(item.id), "operation": "reply"})])
+    rows.append([
+        _button(db, user, "Обработано", "inbox_action", {"id": str(item.id), "operation": "resolve"}),
+        _button(db, user, "Игнорировать", "inbox_action", {"id": str(item.id), "operation": "ignore"}),
+    ])
+    return text, {"inline_keyboard": rows}
+
+
+def object_view(db, user, section: str, object_id: uuid.UUID) -> tuple[str, dict | None]:
+    model = {"tasks": Task, "projects": Project, "sources": Source,
+             "schedule": CalendarEvent}.get(section)
+    item = db.get(model, object_id) if model else None
+    if not item or item.user_id != user.id:
+        return "Объект не найден.", None
+    if section == "schedule":
+        text = f"📅 {item.title}\nСтатус: {item.status}"
+        rows = []
+        if item.status == "pending" and item.sync_attempts >= 4:
+            rows.append([_button(db, user, "Повторить синхронизацию", "calendar_retry", {
+                "id": str(item.id),
+            })])
+        if item.status != "cancelled":
+            rows.append([_button(db, user, "Отменить событие…", "calendar_cancel_prompt", {
+                "id": str(item.id),
+            })])
+    elif section == "tasks":
+        text = f"✅ {item.title}\nСтатус: {item.status}\nПриоритет: {item.priority}"
+        rows = [[_button(db, user, "Выполнено", "task_complete", {"id": str(item.id)})],
+                [_button(db, user, "Удалить…", "task_delete_prompt", {"id": str(item.id)})]]
+    elif section == "projects":
+        text = f"📁 {item.name}\n{'Архив' if item.is_archived else 'Активен'}"
+        rows = [[_button(db, user, "Архивировать", "project_archive", {"id": str(item.id)})]]
+    else:
+        text = f"🔗 {item.name}\nТип: {item.type}\nСтатус: {item.status}"
+        rows = []
+        if item.type in {"gmail", "yandex", "mailru", "imap"} and item.status == "active":
+            rows.append([_button(db, user, "Выбрать папки", "folder_refresh", {"id": str(item.id)})])
+        if item.status in {"active", "paused"}:
+            rows.append([_button(db, user, "Пауза/возобновить", "source_toggle", {"id": str(item.id)})])
+        if item.status != "disconnected":
+            rows.append([_button(db, user, "Отключить…", "source_disconnect_prompt", {"id": str(item.id)})])
+    return text, {"inline_keyboard": rows} if rows else None
+
+
+def folders_view(db, user, source_id: uuid.UUID, page: int = 0) -> tuple[str, dict]:
+    from app.services.domain import SourceService
+
+    folders = sorted(SourceService(db).folders(user, source_id), key=lambda item: item.name.lower())
+    page = max(0, min(page, max(0, (len(folders) - 1) // 8)))
+    rows = [[_button(db, user, f"{'☑' if item.is_selected else '☐'} {item.name}"[:60],
+                     "folder_toggle", {"id": str(source_id), "folder": item.external_folder_id, "page": page})]
+            for item in folders[page * 8:(page + 1) * 8]]
+    pages = []
+    if page:
+        pages.append(_button(db, user, "←", "folder_show", {"id": str(source_id), "page": page - 1}))
+    if (page + 1) * 8 < len(folders):
+        pages.append(_button(db, user, "→", "folder_show", {"id": str(source_id), "page": page + 1}))
+    if pages:
+        rows.append(pages)
+    rows.append([_button(db, user, "Обновить список", "folder_refresh", {"id": str(source_id)})])
+    return "Какие папки читать? Новые папки начнут отслеживаться с момента выбора.", {"inline_keyboard": rows}

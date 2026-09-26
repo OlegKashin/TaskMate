@@ -93,52 +93,114 @@ def gmail_messages(
     token: str, since: datetime, labels: list[str], limit: int = 1000
 ) -> list[MailRecord]:
     headers = {"Authorization": f"Bearer {token}"}
-    params = {
-        "q": f"after:{int((since - timedelta(days=1)).timestamp())}",
-        "maxResults": min(limit, 100),
-    }
-    if labels:
-        params["labelIds"] = labels
     records = []
-    fetched = 0
-    while True:
-        listing = _require_http(
-            httpx.get(
-                "https://gmail.googleapis.com/gmail/v1/users/me/messages",
-                headers=headers,
-                params=params,
-                timeout=20,
-            )
-        )
-        items = listing.get("messages", [])
-        fetched += len(items)
-        if fetched > limit:
-            raise AppError("MAIL_BATCH_TOO_LARGE", "Mailbox batch exceeds sync limit", 503)
-        for item in items:
-            details = _require_http(
+    seen_ids = set()
+    # Gmail combines labelIds with AND; poll each selected label to get their union.
+    for label in labels or [None]:
+        params = {
+            "q": f"after:{int((since - timedelta(days=1)).timestamp())}",
+            "maxResults": min(limit, 100),
+        }
+        if label:
+            params["labelIds"] = [label]
+        while True:
+            listing = _require_http(
                 httpx.get(
-                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{item['id']}",
+                    "https://gmail.googleapis.com/gmail/v1/users/me/messages",
                     headers=headers,
-                    params={"format": "raw"},
+                    params=params,
                     timeout=20,
                 )
             )
-            raw = base64.urlsafe_b64decode(details["raw"] + "===")
-            record = parse_mail(raw, item["id"], details.get("threadId"))
-            if details.get("internalDate"):
-                record.received_at = datetime.fromtimestamp(
-                    int(details["internalDate"]) / 1000, UTC
+            items = listing.get("messages", [])
+            if len(seen_ids | {item["id"] for item in items}) > limit:
+                raise AppError("MAIL_BATCH_TOO_LARGE", "Mailbox batch exceeds sync limit", 503)
+            for item in items:
+                if item["id"] in seen_ids:
+                    continue
+                seen_ids.add(item["id"])
+                if len(seen_ids) > limit:
+                    raise AppError("MAIL_BATCH_TOO_LARGE", "Mailbox batch exceeds sync limit", 503)
+                details = _require_http(
+                    httpx.get(
+                        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{item['id']}",
+                        headers=headers,
+                        params={"format": "raw"},
+                        timeout=20,
+                    )
                 )
-            if record.received_at > since:
-                records.append(record)
-        if not listing.get("nextPageToken"):
-            break
-        params["pageToken"] = listing["nextPageToken"]
+                raw = base64.urlsafe_b64decode(details["raw"] + "===")
+                record = parse_mail(raw, item["id"], details.get("threadId"))
+                if details.get("internalDate"):
+                    record.received_at = datetime.fromtimestamp(
+                        int(details["internalDate"]) / 1000, UTC
+                    )
+                if record.received_at > since:
+                    records.append(record)
+            if not listing.get("nextPageToken"):
+                break
+            params["pageToken"] = listing["nextPageToken"]
     return records
 
 
 IMAP_HOSTS = {"yandex": "imap.yandex.com", "mailru": "imap.mail.ru"}
 SMTP_HOSTS = {"yandex": "smtp.yandex.com", "mailru": "smtp.mail.ru"}
+
+
+def gmail_folders(token: str) -> list[tuple[str, str]]:
+    data = _require_http(httpx.get(
+        "https://gmail.googleapis.com/gmail/v1/users/me/labels",
+        headers={"Authorization": f"Bearer {token}"}, timeout=20,
+    ))
+    return [(item["id"], item.get("name", item["id"]))
+            for item in data.get("labels", []) if item.get("id")]
+
+
+def _decode_imap_name(value: bytes) -> str:
+    name = value.decode("utf-8", "replace")
+
+    def decode_segment(match):
+        encoded = match.group(1)
+        if not encoded:
+            return "&"
+        try:
+            return base64.b64decode(encoded.replace(",", "/") + "===").decode("utf-16-be")
+        except (ValueError, UnicodeError):
+            return match.group(0)
+
+    return re.sub(r"&([A-Za-z0-9+,]*)-", decode_segment, name)
+
+
+def imap_folders(provider: str, username: str, secret: str, *, oauth: bool = True,
+                 host: str | None = None) -> list[tuple[str, str]]:
+    hostname = host or IMAP_HOSTS.get(provider)
+    if not hostname:
+        raise AppError("MAIL_NOT_CONFIGURED", "IMAP host is missing", 503)
+    try:
+        with imaplib.IMAP4_SSL(hostname, 993, timeout=20) as client:
+            try:
+                if oauth:
+                    client.authenticate("XOAUTH2", lambda _: _xoauth2(username, secret))
+                else:
+                    client.login(username, secret)
+            except imaplib.IMAP4.error as exc:
+                raise AppError("MAIL_REAUTH_REQUIRED", "Reconnect the mailbox", 401) from exc
+            status, rows = client.list()
+            if status != "OK":
+                raise AppError("MAIL_PROVIDER_ERROR", "IMAP folder list failed", 502)
+            folders = []
+            for row in rows or []:
+                if not row or b"\\Noselect" in row:
+                    continue
+                match = re.match(rb'^\([^)]*\)\s+(?:"[^"]*"|NIL)\s+(.+)$', row)
+                if not match:
+                    continue
+                folder_id = match.group(1).strip().strip(b'"').decode("ascii", "replace")
+                if folder_id:
+                    folders.append((folder_id, _decode_imap_name(match.group(1).strip().strip(b'"'))))
+            return folders
+    except (imaplib.IMAP4.error, OSError) as exc:
+        raise AppError("MAIL_PROVIDER_ERROR", "IMAP connection failed", 502) from exc
 
 
 def _xoauth2(username: str, token: str) -> bytes:
@@ -162,12 +224,16 @@ def imap_messages(
     records = []
     try:
         with imaplib.IMAP4_SSL(hostname, 993, timeout=20) as client:
-            if oauth:
-                client.authenticate("XOAUTH2", lambda _: _xoauth2(username, secret))
-            else:
-                client.login(username, secret)
+            try:
+                if oauth:
+                    client.authenticate("XOAUTH2", lambda _: _xoauth2(username, secret))
+                else:
+                    client.login(username, secret)
+            except imaplib.IMAP4.error as exc:
+                raise AppError("MAIL_REAUTH_REQUIRED", "Reconnect the mailbox", 401) from exc
             for folder in folders or ["INBOX"]:
-                status, _ = client.select(folder, readonly=True)
+                quoted = '"' + folder.replace("\\", "\\\\").replace('"', '\\"') + '"'
+                status, _ = client.select(quoted, readonly=True)
                 if status != "OK":
                     raise AppError("MAIL_FOLDER_ERROR", "Cannot open selected folder", 502)
                 validity = client.response("UIDVALIDITY")[1]

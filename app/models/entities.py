@@ -283,6 +283,8 @@ class CalendarEvent(UUIDMixin, TimestampMixin, Base):
     start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(32), default="pending")
+    sync_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (UniqueConstraint("connection_id", "external_event_id"),)
 
 

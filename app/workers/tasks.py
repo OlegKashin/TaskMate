@@ -2,21 +2,39 @@ import asyncio
 import uuid
 from datetime import timedelta
 
-from sqlalchemy import or_
+from sqlalchemy import or_, select
 
 from app.ai.service import AIService
 from app.bot.presentation import outcome_message
 from app.core.config import get_settings
+from app.core.errors import AppError
 from app.db.session import SessionLocal
 from app.integrations.telegram.client import TelegramClient
-from app.models.entities import AIProcessingJob, Message, OAuthState, UIAction, User, utcnow
+from app.models.entities import (
+    AIProcessingJob,
+    Message,
+    Notification,
+    OAuthState,
+    Source,
+    UIAction,
+    User,
+    utcnow,
+)
 from app.services.attachments import save_telegram_attachment
-from app.services.domain import CalendarService, NotificationService, ReminderService
+from app.services.domain import (
+    CalendarService,
+    NotificationService,
+    ReminderService,
+    UIActionService,
+)
 from app.services.email import EmailService
 from app.workers.celery_app import celery_app
 
+RETRY_DELAYS = (30, 120, 600)
+RETRYABLE_CODES = {"LLM_REQUEST_FAILED", "STT_REQUEST_FAILED", "TELEGRAM_FILE_ERROR"}
 
-@celery_app.task(bind=True, autoretry_for=(TimeoutError,), retry_backoff=True, max_retries=3)
+
+@celery_app.task(bind=True, max_retries=3)
 def process_message(self, job_id: str):
     with SessionLocal() as db:
         job = db.get(AIProcessingJob, uuid.UUID(job_id))
@@ -40,25 +58,50 @@ def process_message(self, job_id: str):
                 outcome = {"state": "informational", "reason": "Вложение сохранено."}
             else:
                 outcome = asyncio.run(AIService(db).process(job, message, user))
-        except Exception:
-            job.status = "failed"
-            job.error_code = job.error_code or "PROCESSING_ERROR"
-            message.processing_status = "failed"
+        except Exception as exc:
+            retryable = isinstance(exc, TimeoutError) or (
+                isinstance(exc, AppError) and exc.code in RETRYABLE_CODES
+            )
+            will_retry = retryable and self.request.retries < len(RETRY_DELAYS)
+            job.status = "queued" if will_retry else "failed"
+            job.error_code = exc.code if isinstance(exc, AppError) else "PROCESSING_ERROR"
+            message.processing_status = "queued" if will_retry else "failed"
             db.commit()
+            if will_retry:
+                raise self.retry(exc=exc, countdown=RETRY_DELAYS[self.request.retries]) from exc
             if chat_id is not None:
                 try:
                     client = TelegramClient()
                     failure = (
                         "Распознавание голосовых пока не настроено. Отправьте текстом."
                         if job.error_code == "STT_NOT_CONFIGURED"
-                        else "Не удалось обработать сообщение. Попробуйте отправить его ещё раз."
+                        else "Сейчас не получилось обработать сообщение. Оно сохранено, можно повторить позже."
                     )
+                    markup = None
+                    if job.error_code != "STT_NOT_CONFIGURED":
+                        retry_token = UIActionService(db).create(
+                            user, "retry_job", {"id": str(job.id)}, ttl_seconds=86400,
+                        )
+                        later_token = UIActionService(db).create(
+                            user, "leave_job", {"id": str(job.id)}, ttl_seconds=86400,
+                        )
+                        markup = {"inline_keyboard": [[
+                            {"text": "Повторить", "callback_data": retry_token},
+                            {"text": "Оставить на потом", "callback_data": later_token},
+                        ]]}
                     if job.status_message_id:
-                        client.edit_message(chat_id, job.status_message_id, failure)
+                        client.edit_message(chat_id, job.status_message_id, failure, markup)
                     else:
-                        client.send_message(chat_id, failure)
+                        client.send_message(chat_id, failure, markup)
                 except Exception:
                     pass
+            else:
+                db.add(Notification(
+                    user_id=user.id, type="ai_processing_failed",
+                    payload={"title": "Не удалось обработать письмо. Оно сохранено; запустите /analyze для повтора."},
+                    dedupe_key=f"ai-failed:{job.id}",
+                ))
+                db.commit()
             raise
         if chat_id is not None:
             text, markup = outcome_message(db, user, outcome)
@@ -70,9 +113,8 @@ def process_message(self, job_id: str):
         return outcome
 
 
-@celery_app.task
-def sync_mail_source(source_id: str):
-    from app.models.entities import Source
+@celery_app.task(bind=True, max_retries=3)
+def sync_mail_source(self, source_id: str):
     from app.services.analysis import queue_source_analysis
 
     with SessionLocal() as db:
@@ -80,9 +122,30 @@ def sync_mail_source(source_id: str):
         if not source or source.status != "active":
             return {"imported": 0, "status": "inactive"}
         user = db.get(User, source.user_id)
-        imported = EmailService(db).sync(user, source.id)
-        analysis = queue_source_analysis(db, user, source.id, sync_external=False)
-        return {"imported": imported, "status": "completed", "analysis": analysis}
+        try:
+            imported = EmailService(db).sync(user, source.id)
+            analysis = queue_source_analysis(db, user, source.id, sync_external=False)
+            return {"imported": imported, "status": "completed", "analysis": analysis}
+        except Exception as exc:
+            retryable = isinstance(exc, TimeoutError) or (
+                isinstance(exc, AppError) and exc.code == "MAIL_PROVIDER_ERROR"
+            )
+            if retryable and self.request.retries < len(RETRY_DELAYS):
+                db.rollback()
+                raise self.retry(exc=exc, countdown=RETRY_DELAYS[self.request.retries]) from exc
+            if retryable or (
+                isinstance(exc, AppError) and exc.code == "MAIL_NOT_CONFIGURED"
+            ):
+                db.rollback()
+                source = db.get(Source, uuid.UUID(source_id))
+                if source.status == "active":
+                    source.status = "error"
+                    db.add(Notification(
+                        user_id=source.user_id, type="source_error",
+                        payload={"title": f"Не удалось синхронизировать почту «{source.name}». Проверьте подключение."},
+                    ))
+                    db.commit()
+            raise
 
 
 @celery_app.task
@@ -93,7 +156,18 @@ def schedule_tick():
         briefings = notifications.enqueue_briefings()
         sent = notifications.deliver_pending()
         events = CalendarService(db).sync_pending()
-        mail = EmailService(db).sync_all()
+        source_ids = db.scalars(select(Source.id).where(
+            Source.status == "active",
+            Source.type.in_(["gmail", "yandex", "mailru", "imap"]),
+        ).order_by(Source.last_synced_at.asc()).limit(25)).all()
+        queued = 0
+        for source_id in source_ids:
+            try:
+                sync_mail_source.delay(str(source_id))
+                queued += 1
+            except Exception:
+                pass
+        mail = {"sources": len(source_ids), "queued": queued}
         return {"reminders_fired": fired, "briefings_created": briefings, "notifications_sent": sent, "calendar_events_synced": events, "mail": mail}
 
 

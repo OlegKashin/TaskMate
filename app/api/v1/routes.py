@@ -190,6 +190,11 @@ def patch_folders(object_id: uuid.UUID, payload: FolderPatch, db: DB, user: Curr
     )
 
 
+@router.post("/sources/{object_id}/folders/discover")
+def discover_folders(object_id: uuid.UUID, db: DB, user: CurrentUser):
+    return ok(EmailService(db).discover_folders(user, object_id))
+
+
 @router.post("/sources/{object_id}/imap-credentials")
 def configure_imap(object_id: uuid.UUID, payload: IMAPCredentials, db: DB, user: CurrentUser):
     return ok(EmailService(db).configure_imap(user, object_id, payload.username, payload.password))
@@ -337,6 +342,11 @@ def event_patch(object_id: uuid.UUID, payload: EventPatch, db: DB, user: Current
 @router.post("/calendar/events/{object_id}/cancel")
 def event_cancel(object_id: uuid.UUID, db: DB, user: CurrentUser):
     return ok(CalendarService(db).cancel(user, object_id))
+
+
+@router.post("/calendar/events/{object_id}/retry")
+def event_retry(object_id: uuid.UUID, db: DB, user: CurrentUser):
+    return ok(CalendarService(db).retry(user, object_id))
 
 
 @router.get("/calendar/connections")

@@ -7,13 +7,15 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from app.ai.service import AIActionService
+from app.bot.actions import handle_action
+from app.bot.views import object_view, section_view
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError
-from app.core.security import SecretBox
+from app.core.security import SecretBox, issue_user_token
 from app.integrations.calendar import GoogleCalendarAPI
 from app.models.entities import CalendarConnection, CalendarEvent, Notification
 from app.schemas.domain import AIAction, AIResult
-from app.services.domain import CalendarService, UserService
+from app.services.domain import CalendarService, NotificationService, UIActionService, UserService
 from app.services.oauth import OAuthService
 
 
@@ -99,6 +101,91 @@ def test_calendar_transport_failure_leaves_pending(db, monkeypatch):
     connection.status = "disconnected"
     db.commit()
     assert CalendarService(db).sync_pending() == 0
+
+
+def test_calendar_retry_schedule_and_bot_actions(db, monkeypatch):
+    user, _connection, event = connection_and_event(db)
+    monkeypatch.setattr(GoogleCalendarAPI, "save", Mock(side_effect=AppError(
+        "CALENDAR_SYNC_FAILED", "offline", 502,
+    )))
+    service = CalendarService(db)
+    for attempt, delay in enumerate((30, 120, 600), 1):
+        before = datetime.now(UTC)
+        assert service.sync_pending() == 0
+        assert event.sync_attempts == attempt
+        assert delay - 2 <= (event.next_sync_at.replace(tzinfo=UTC) - before).total_seconds() <= delay + 2
+        event.next_sync_at = datetime.now(UTC) - timedelta(seconds=1)
+        db.commit()
+    assert service.sync_pending() == 0
+    assert event.sync_attempts == 4 and event.next_sync_at is None
+    assert service.sync_pending() == 0
+    assert db.query(Notification).filter_by(user_id=user.id, type="calendar_error").count() == 1
+    client = Mock()
+    client.send_message.return_value = {"message_id": 1}
+    assert NotificationService(db).deliver_pending(client) == 1
+    assert client.send_message.call_args.args[2]["inline_keyboard"][0][0]["text"] == "Повторить"
+
+    text, markup = section_view(db, user, "schedule")
+    assert markup and "Meeting" in text + str(markup)
+    text, markup = object_view(db, user, "schedule", event.id)
+    assert "Meeting" in text
+    retry_token = markup["inline_keyboard"][0][0]["callback_data"]
+    action = UIActionService(db).consume(user, retry_token, "calendar_retry")
+    text, _ = handle_action(db, user, action)
+    assert "запланирована" in text
+    assert event.sync_attempts == 0
+    monkeypatch.setattr(GoogleCalendarAPI, "save", Mock(return_value="remote-id"))
+    assert service.sync_pending() == 1
+    assert event.status == "confirmed"
+
+    text, markup = object_view(db, user, "schedule", event.id)
+    cancel_token = markup["inline_keyboard"][0][0]["callback_data"]
+    action = UIActionService(db).consume(user, cancel_token, "calendar_cancel_prompt")
+    text, markup = handle_action(db, user, action)
+    assert "Отменить событие" in text and "Google Calendar" in text and "Undo" in text
+    retry_failed = Mock(side_effect=AppError("CALENDAR_CANCEL_FAILED", "offline", 502))
+    monkeypatch.setattr(GoogleCalendarAPI, "delete", retry_failed)
+    confirm_token = markup["inline_keyboard"][0][0]["callback_data"]
+    action = UIActionService(db).consume(user, confirm_token, "calendar_cancel")
+    text, markup = handle_action(db, user, action)
+    assert "Повторить" in str(markup) and event.status == "confirmed"
+    monkeypatch.setattr(GoogleCalendarAPI, "delete", Mock())
+    confirm_token = markup["inline_keyboard"][0][0]["callback_data"]
+    action = UIActionService(db).consume(user, confirm_token, "calendar_cancel")
+    text, _ = handle_action(db, user, action)
+    assert "отменено" in text and event.status == "cancelled"
+
+
+def test_calendar_reconnect_error_and_retry_api(db, client, monkeypatch):
+    user, connection, event = connection_and_event(db)
+    monkeypatch.setattr(GoogleCalendarAPI, "save", Mock(side_effect=AppError(
+        "CALENDAR_RECONNECT_REQUIRED", "token invalid", 401,
+    )))
+    assert CalendarService(db).sync_pending() == 0
+    assert connection.status == "error" and event.sync_attempts == 4
+    sender = Mock()
+    sender.send_message.return_value = {"message_id": 1}
+    assert NotificationService(db).deliver_pending(sender) == 1
+    assert sender.send_message.call_args.args[2]["inline_keyboard"][0][0]["text"] == "Переподключить"
+    headers = {"Authorization": f"Bearer {issue_user_token(user.telegram_user_id)}"}
+    response = client.post(f"/api/v1/calendar/events/{event.id}/retry", headers=headers)
+    assert response.status_code == 409
+    connection.status = "active"
+    db.commit()
+    response = client.post(f"/api/v1/calendar/events/{event.id}/retry", headers=headers)
+    assert response.status_code == 200
+    assert event.sync_attempts == 0
+
+
+def test_pending_local_calendar_event_can_be_cancelled_offline(db, monkeypatch):
+    user, connection, event = connection_and_event(db)
+    connection.status = "error"
+    db.commit()
+    delete = Mock()
+    monkeypatch.setattr(GoogleCalendarAPI, "delete", delete)
+    assert CalendarService(db).cancel(user, event.id).status == "cancelled"
+    assert CalendarService(db).cancel(user, event.id).status == "cancelled"
+    delete.assert_not_called()
 
 
 def test_ai_calendar_and_unsafe_actions(db):

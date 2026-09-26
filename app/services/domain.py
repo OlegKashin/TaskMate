@@ -138,10 +138,17 @@ class ProjectService(OwnedService):
                 )
         for key, value in values.items():
             setattr(project, key, value)
+        if project.is_archived:
+            settings = self.db.get(UserSettings, user.id)
+            if settings and settings.default_project_id == project.id:
+                settings.default_project_id = None
         self.db.commit()
         return project
 
     def delete(self, user: User, project_id: uuid.UUID) -> None:
+        settings = self.db.get(UserSettings, user.id)
+        if settings and settings.default_project_id == project_id:
+            settings.default_project_id = None
         self.db.delete(self.get(user, project_id))
         self.db.commit()
 
@@ -193,6 +200,11 @@ class TaskService(OwnedService):
         return f"a:{base36(action.id)}"
 
     def create(self, user: User, values: dict[str, Any], source="user_command") -> tuple[Task, str]:
+        values = dict(values)
+        if "project_id" not in values:
+            settings = self.db.get(UserSettings, user.id)
+            if settings and settings.default_project_id:
+                values["project_id"] = settings.default_project_id
         self._project(user, values.get("project_id"))
         if values.get("source_message_id"):
             duplicate = self.db.scalar(
@@ -611,8 +623,21 @@ class NotificationService(OwnedService):
                 body = section_message(self.db, user, "stats")
             else:
                 body = notification.payload.get("title") or notification.type
+            markup = None
+            if notification.type == "calendar_error" and notification.payload.get("event_id"):
+                event = self.db.get(CalendarEvent, uuid.UUID(notification.payload["event_id"]))
+                if event and event.user_id == user.id:
+                    if self.db.get(CalendarConnection, event.connection_id).status == "active":
+                        label, action, payload = "Повторить", "calendar_retry", {"id": str(event.id)}
+                    else:
+                        label, action, payload = "Переподключить", "connect_provider", {"provider": "google"}
+                    token = UIActionService(self.db).create(user, action, payload, ttl_seconds=86400)
+                    markup = {"inline_keyboard": [[
+                        {"text": label, "callback_data": token},
+                    ]]}
             try:
-                response = client.send_message(user.telegram_user_id, body)
+                response = (client.send_message(user.telegram_user_id, body, markup)
+                            if markup else client.send_message(user.telegram_user_id, body))
             except Exception:
                 # Leave it pending for the next scheduler tick.
                 continue
@@ -664,6 +689,8 @@ class CalendarService(OwnedService):
         if event.end_at <= event.start_at:
             raise AppError("VALIDATION_ERROR", "end_at must be after start_at", 422)
         event.status = "pending"
+        event.sync_attempts = 0
+        event.next_sync_at = None
         self.db.commit()
         return event
 
@@ -672,9 +699,14 @@ class CalendarService(OwnedService):
 
         api = GoogleCalendarAPI(self.db)
         synced = 0
+        now = utcnow()
         events = self.db.scalars(
             select(CalendarEvent)
-            .where(CalendarEvent.status == "pending")
+            .where(
+                CalendarEvent.status == "pending",
+                CalendarEvent.sync_attempts < 4,
+                or_(CalendarEvent.next_sync_at.is_(None), CalendarEvent.next_sync_at <= now),
+            )
             .order_by(CalendarEvent.created_at)
             .limit(limit)
         ).all()
@@ -684,22 +716,56 @@ class CalendarService(OwnedService):
                 continue
             try:
                 event.external_event_id = api.save(connection, event)
-            except AppError:
+            except AppError as exc:
+                if exc.code == "CALENDAR_RECONNECT_REQUIRED":
+                    connection.status = "error"
+                    event.sync_attempts = 4
+                else:
+                    delay = (30, 120, 600)
+                    event.sync_attempts += 1
+                    event.next_sync_at = (
+                        now + timedelta(seconds=delay[event.sync_attempts - 1])
+                        if event.sync_attempts <= 3 else None
+                    )
+                if event.sync_attempts >= 4:
+                    self.db.add(Notification(
+                        user_id=event.user_id, type="calendar_error",
+                        payload={"event_id": str(event.id), "title": f"Не удалось синхронизировать событие «{event.title}». Проверьте календарь и повторите отправку."},
+                    ))
+                self.db.commit()
                 continue
             event.status = "confirmed"
+            event.sync_attempts = 0
+            event.next_sync_at = None
             self.db.commit()
             synced += 1
         return synced
 
-    def cancel(self, user, object_id):
-        event = self.get(user, object_id)
+    def retry(self, user: User, event_id: uuid.UUID) -> CalendarEvent:
+        event = self.get(user, event_id)
+        if event.status != "pending":
+            raise conflict("CALENDAR_NOT_PENDING", "Only pending events can be retried")
         connection = self.db.get(CalendarConnection, event.connection_id)
         if not connection or connection.status != "active":
-            raise conflict("CALENDAR_DISCONNECTED", "Calendar connection is not active")
-        from app.integrations.calendar import GoogleCalendarAPI
+            raise conflict("CALENDAR_DISCONNECTED", "Reconnect Google Calendar first")
+        event.sync_attempts = 0
+        event.next_sync_at = None
+        self.db.commit()
+        return event
 
-        GoogleCalendarAPI(self.db).delete(connection, event)
+    def cancel(self, user, object_id):
+        event = self.get(user, object_id)
+        if event.status == "cancelled":
+            return event
+        if event.external_event_id:
+            connection = self.db.get(CalendarConnection, event.connection_id)
+            if not connection or connection.status != "active":
+                raise conflict("CALENDAR_DISCONNECTED", "Calendar connection is not active")
+            from app.integrations.calendar import GoogleCalendarAPI
+
+            GoogleCalendarAPI(self.db).delete(connection, event)
         event.status = "cancelled"
+        event.next_sync_at = None
         self.db.commit()
         return event
 

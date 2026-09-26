@@ -325,7 +325,17 @@ class OAuthService:
         self.db.commit()
         user = self.db.get(User, state.user_id)
         try:
-            if TelegramClient().send_message(user.telegram_user_id, notification.payload["title"]):
+            markup = None
+            title = notification.payload["title"]
+            if provider != "google":
+                from app.services.domain import UIActionService
+
+                token = UIActionService(self.db).create(
+                    user, "folder_refresh", {"id": str(result.id)}, ttl_seconds=86400,
+                )
+                title += "\nКакие папки читать? По умолчанию — Входящие."
+                markup = {"inline_keyboard": [[{"text": "Выбрать папки", "callback_data": token}]]}
+            if TelegramClient().send_message(user.telegram_user_id, title, markup):
                 notification.status = "sent"
                 notification.sent_at = utcnow()
                 self.db.commit()

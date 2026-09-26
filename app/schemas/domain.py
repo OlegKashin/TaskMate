@@ -189,7 +189,7 @@ class AIResult(BaseModel):
             "create_waiting_for": ("title",),
         }
         missing = [key for key in required.get(self.intent, ()) if self.entities.get(key) is None]
-        if missing:
+        if missing and self.confidence >= 0.60:
             raise ValueError(f"Missing entities for {self.intent}: {', '.join(missing)}")
         if self.action.type not in {self.intent, "none"}:
             raise ValueError("action.type does not match intent")

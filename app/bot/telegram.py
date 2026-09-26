@@ -1,4 +1,6 @@
 import uuid
+from datetime import time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Header
 from sqlalchemy import select
@@ -6,12 +8,22 @@ from sqlalchemy.exc import IntegrityError
 
 from app.ai.service import AIActionService
 from app.api.deps import DB
+from app.bot.actions import ACTIONS, handle_action
 from app.bot.presentation import outcome_message, section_message
+from app.bot.views import section_view
 from app.core.config import get_settings
 from app.core.errors import AppError
 from app.core.security import issue_user_token
 from app.integrations.telegram.client import TelegramClient, main_menu
-from app.models.entities import AIProcessingJob, Message, Source, TelegramUpdate, User
+from app.models.entities import (
+    AIProcessingJob,
+    InboxItem,
+    Message,
+    Source,
+    TelegramUpdate,
+    User,
+    UserSettings,
+)
 from app.schemas.domain import AIResult
 from app.services.analysis import queue_source_analysis
 from app.services.domain import SourceService, TaskService, UIActionService, UserService, utcnow
@@ -28,6 +40,7 @@ def email_connect_menu(db, user):
         ("yandex", "Яндекс.Почта"),
         ("mailru", "Mail.ru"),
         ("imap", "Другой IMAP"),
+        ("google", "Google Calendar"),
     )
     return {
         "inline_keyboard": [
@@ -47,7 +60,13 @@ def email_connect_menu(db, user):
                         user, "connect_provider", {"provider": provider}
                     ),
                 }
-                for provider, label in labels[2:]
+                for provider, label in labels[2:4]
+            ],
+            [
+                {
+                    "text": labels[4][1],
+                    "callback_data": actions.create(user, "connect_provider", {"provider": labels[4][0]}),
+                }
             ],
         ]
     }
@@ -100,6 +119,48 @@ def telegram_webhook(
         callback_message = callback.get("message", {})
         chat_id = callback_message.get("chat", {}).get("id", tg_id)
         message_id = callback_message.get("message_id")
+        if callback_message.get("chat", {}).get("type") != "private" and (
+            action.action in ACTIONS or action.action in {"navigate", "send_email", "retry_email", "edit_email"}
+        ):
+            client.answer_callback(callback.get("id"), "Откройте этот раздел в личном чате с ботом")
+            db.commit()
+            return {"ok": True, "ignored": True, "reason": "private_action"}
+        if action.action in ACTIONS:
+            text, markup = handle_action(db, user, action)
+            if message_id:
+                client.edit_message(chat_id, message_id, text, markup)
+            else:
+                client.send_message(chat_id, text, markup)
+            client.answer_callback(callback.get("id"))
+            db.commit()
+            return {"ok": True, "action": action.action}
+        if action.action in {"retry_job", "leave_job"}:
+            job = db.get(AIProcessingJob, uuid.UUID(action.payload["id"]))
+            if not job or job.user_id != user.id:
+                response = "Сообщение для повторной обработки не найдено."
+            elif action.action == "leave_job":
+                response = "Сообщение сохранено. Позже используйте /analyze."
+            else:
+                job.status = "queued"
+                job.error_code = None
+                original = db.get(Message, job.message_id) if job.message_id else None
+                if original:
+                    original.processing_status = "queued"
+                db.commit()
+                from app.workers.tasks import process_message
+
+                try:
+                    process_message.delay(str(job.id))
+                    response = "Повторная обработка запущена."
+                except Exception:
+                    response = "Очередь временно недоступна. Сообщение сохранено."
+            if message_id:
+                client.edit_message(chat_id, message_id, response)
+            else:
+                client.send_message(chat_id, response)
+            client.answer_callback(callback.get("id"))
+            db.commit()
+            return {"ok": True, "action": action.action}
         if action.action == "confirm_ai":
             message = (
                 db.get(Message, uuid.UUID(action.payload["message_id"]))
@@ -109,6 +170,13 @@ def telegram_webhook(
             outcome = AIActionService(db).execute(
                 user, AIResult.model_validate(action.payload["result"]), message
             )
+            if message and outcome.get("state") == "executed":
+                for item in db.scalars(select(InboxItem).where(
+                    InboxItem.user_id == user.id, InboxItem.message_id == message.id,
+                    InboxItem.status == "proposed",
+                )):
+                    item.status = "resolved"
+                    item.resolved_at = utcnow()
             text, markup = outcome_message(db, user, outcome)
             if message_id:
                 client.edit_message(chat_id, message_id, text, markup)
@@ -125,13 +193,14 @@ def telegram_webhook(
             return {"ok": True, "undone": str(task.id)}
         if action.action == "navigate":
             section = action.payload["section"]
+            section_text, section_markup = section_view(db, user, section)
+            if section == "sources" and callback_message.get("chat", {}).get("type") == "private":
+                connect_rows = email_connect_menu(db, user)["inline_keyboard"]
+                section_markup = {"inline_keyboard": (section_markup or {"inline_keyboard": []})["inline_keyboard"] + connect_rows}
             client.send_message(
                 chat_id,
-                section_message(db, user, section),
-                email_connect_menu(db, user)
-                if section == "sources"
-                and callback_message.get("chat", {}).get("type") == "private"
-                else None,
+                section_text,
+                section_markup,
             )
             client.answer_callback(callback.get("id"))
             db.commit()
@@ -142,7 +211,7 @@ def telegram_webhook(
                 db.commit()
                 return {"ok": True, "ignored": True}
             provider = action.payload["provider"]
-            if provider in {"gmail", "yandex"}:
+            if provider in {"gmail", "yandex", "google"}:
                 try:
                     send_oauth_link(db, user, chat_id, provider)
                 except AppError as exc:
@@ -163,20 +232,53 @@ def telegram_webhook(
             try:
                 sent = EmailService(db).send_consumed_reply(user, action)
             except AppError as exc:
+                retry = UIActionService(db).create(user, "retry_email", {
+                    "message_id": action.payload["message_id"],
+                    "draft_text": action.payload["draft_text"],
+                })
+                edit = UIActionService(db).create(user, "edit_email", {
+                    "message_id": action.payload["message_id"],
+                    "send_token": callback.get("data", ""),
+                })
                 client.send_message(
                     chat_id,
                     (
-                        "Не удалось подтвердить отправку. Проверьте исходящие письма перед повтором. "
+                        "Не удалось подтвердить отправку. Черновик сохранён. "
+                        "Перед повтором проверьте папку «Отправленные»: письмо могло уйти до обрыва связи. "
                         f"Черновик: {action.payload['draft_text'][:2000]}\n"
-                        f"Новый ответ: /reply {action.payload['message_id']} <текст>. "
                         f"Причина: {exc.message}"
                     ),
+                    {"inline_keyboard": [[
+                        {"text": "Повторить после проверки", "callback_data": retry},
+                        {"text": "Изменить", "callback_data": edit},
+                    ]]},
                 )
                 client.answer_callback(callback.get("id"))
                 return {"ok": True, "sent": False, "error": exc.code}
             client.send_message(chat_id, "Ответ отправлен.")
+            target = uuid.UUID(action.payload["message_id"])
+            for item in db.scalars(select(InboxItem).where(
+                InboxItem.user_id == user.id, InboxItem.message_id == target,
+                InboxItem.item_type == "reply_required", InboxItem.status == "proposed",
+            )):
+                item.status = "resolved"
+                item.resolved_at = utcnow()
+            db.commit()
             client.answer_callback(callback.get("id"))
             return {"ok": True, "sent": sent}
+        if action.action == "retry_email":
+            token = EmailService(db).draft_for_message(
+                user, uuid.UUID(action.payload["message_id"]), action.payload["draft_text"]
+            )
+            text, markup = outcome_message(db, user, {
+                "state": "email_draft", "token": token,
+                "message_id": action.payload["message_id"],
+                "draft_text": action.payload["draft_text"],
+            })
+            client.send_message(chat_id, "После проверки «Отправленных» подтвердите повторную отправку.\n" + text, markup)
+            client.answer_callback(callback.get("id"))
+            db.commit()
+            return {"ok": True, "draft": True}
         if action.action in {"edit_email", "cancel_email"}:
             try:
                 UIActionService(db).consume(user, action.payload["send_token"], "send_email")
@@ -225,7 +327,7 @@ def telegram_webhook(
     command = (message_data.get("text") or "").split(maxsplit=1)[0].lower()
     command = command.split("@", 1)[0]
     if command == "/connect" and chat.get("type") == "private":
-        TelegramClient().send_message(chat_id, "Подключить почту:", email_connect_menu(db, user))
+        TelegramClient().send_message(chat_id, "Подключить почту или календарь:", email_connect_menu(db, user))
         db.commit()
         return {"ok": True, "command": "connect"}
     if command == "/connect_mailru" and chat.get("type") == "private":
@@ -269,6 +371,84 @@ def telegram_webhook(
         TelegramClient().send_message(chat_id, text, markup)
         db.commit()
         return {"ok": True, "draft": True}
+    if command == "/clarify" and chat.get("type") == "private":
+        parts = (message_data.get("text") or "").split(maxsplit=2)
+        if len(parts) != 3:
+            TelegramClient().send_message(chat_id, "Напишите: /clarify <message-id> <уточнение>")
+            db.commit()
+            return {"ok": True, "clarification": False}
+        try:
+            original_id = uuid.UUID(parts[1])
+        except ValueError as exc:
+            raise AppError("VALIDATION_ERROR", "Invalid message ID", 422) from exc
+        original = db.get(Message, original_id)
+        if not original or original.user_id != user.id:
+            raise AppError("MESSAGE_NOT_FOUND", "Message not found", 404)
+        private_source = db.scalar(select(Source).where(
+            Source.user_id == user.id, Source.type == "telegram_chat",
+            Source.external_source_id == str(chat_id),
+        ))
+        if not private_source:
+            private_source = SourceService(db).create(user, {
+                "type": "telegram_chat", "name": "Telegram",
+                "external_source_id": str(chat_id),
+            })
+        refined = Message(
+            user_id=user.id, source_id=private_source.id,
+            external_message_id=str(message_data.get("message_id")),
+            message_type="text", received_at=utcnow(), raw_payload=payload,
+            text=(f"Исходное сообщение (ID {original.id}):\n"
+                  f"{original.subject or ''}\n{original.text or ''}\n"
+                  f"Уточнение пользователя: {parts[2]}"),
+            processing_status="queued",
+        )
+        db.add(refined)
+        db.flush()
+        job = AIProcessingJob(user_id=user.id, message_id=refined.id, job_type="interpret", status="queued")
+        sent = TelegramClient().send_message(chat_id, "🤔 Уточняю запрос...")
+        if sent:
+            job.status_message_id = sent.get("message_id")
+        db.add(job)
+        db.commit()
+        from app.workers.tasks import process_message
+
+        try:
+            process_message.delay(str(job.id))
+        except Exception:
+            pass
+        return {"ok": True, "clarification": True, "job_id": str(job.id)}
+    if command == "/timezone" and chat.get("type") == "private":
+        parts = (message_data.get("text") or "").split(maxsplit=1)
+        if len(parts) != 2:
+            response = "Укажите часовой пояс: /timezone Europe/Moscow"
+        else:
+            try:
+                ZoneInfo(parts[1].strip())
+            except ZoneInfoNotFoundError:
+                response = "Неизвестный часовой пояс. Например: /timezone Europe/Moscow"
+            else:
+                user.timezone = parts[1].strip()
+                response = f"Часовой пояс установлен: {user.timezone}"
+        TelegramClient().send_message(chat_id, response)
+        db.commit()
+        return {"ok": True, "command": "timezone"}
+    if command in {"/briefing_time", "/stats_time"} and chat.get("type") == "private":
+        parts = (message_data.get("text") or "").split(maxsplit=1)
+        if len(parts) != 2:
+            response = f"Укажите время: {command} 08:00"
+        else:
+            try:
+                scheduled = time.fromisoformat(parts[1].strip())
+            except ValueError:
+                response = "Неизвестное время. Используйте формат ЧЧ:ММ."
+            else:
+                settings = db.get(UserSettings, user.id)
+                field = "morning_briefing_time" if command == "/briefing_time" else "evening_stats_time"
+                setattr(settings, field, scheduled)
+                response = f"Время обновлено: {scheduled:%H:%M} ({user.timezone})."
+        TelegramClient().send_message(chat_id, response)
+        db.commit()
+        return {"ok": True, "command": command.removeprefix("/")}
     if command == "/connect" and chat.get("type") in {"group", "supergroup"}:
         member = TelegramClient().get_chat_member(chat_id, tg_id)
         if not member or member.get("status") not in {"creator", "administrator"}:
