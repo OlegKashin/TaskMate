@@ -28,23 +28,29 @@ def oauth_authorize(provider: str, state: str, db: DB):
 
 
 @router.get("/{provider}/callback")
-def oauth_callback(provider: str, state: str, db: DB,
-                   code: str | None = None, error: str | None = None):
+def oauth_callback(
+    provider: str, state: str, db: DB, code: str | None = None, error: str | None = None
+):
     service = OAuthService(db)
     if error:
         try:
             service.fail(provider, state)
         except AppError:
             pass
-        return HTMLResponse("<html><body><h1>Подключение отменено</h1>"
-                            "<p>Вернитесь в Telegram и повторите попытку.</p></body></html>",
-                            status_code=400)
+        return HTMLResponse(
+            "<html><body><h1>Подключение отменено</h1>"
+            "<p>Вернитесь в Telegram и повторите попытку.</p></body></html>",
+            status_code=400,
+        )
     try:
         result = service.complete(provider, state, code or "")
     except AppError as exc:
-        return HTMLResponse(f"<html><body><h1>Не удалось подключить</h1>"
-                            f"<p>{escape(exc.message)}</p></body></html>",
-                            status_code=exc.status_code)
-    return HTMLResponse(f"<html><body><h1>Подключено</h1>"
-                        f"<p>{escape(provider)}: {escape(str(result.id))}</p>"
-                        "<p>Можно вернуться в Telegram.</p></body></html>")
+        return HTMLResponse(
+            f"<html><body><h1>Не удалось подключить</h1><p>{escape(exc.message)}</p></body></html>",
+            status_code=exc.status_code,
+        )
+    return HTMLResponse(
+        f"<html><body><h1>Подключено</h1>"
+        f"<p>{escape(provider)}: {escape(str(result.id))}</p>"
+        "<p>Можно вернуться в Telegram.</p></body></html>"
+    )

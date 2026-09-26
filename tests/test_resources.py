@@ -1,7 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
-from app.models.entities import CalendarConnection, InboxItem, Message, SourceFolder
-from app.services.domain import SourceService, UserService
+from app.models.entities import CalendarConnection, InboxItem, Message, Source, SourceFolder
+from app.services.domain import UserService
 
 
 def unwrap(response, status=200):
@@ -55,9 +55,15 @@ def test_source_disconnect_reconnect_and_settings(client, db, headers):
 
 def test_source_folders(client, db, headers):
     user = UserService(db).get_or_create(1001)
-    source = SourceService(db).create(
-        user, {"type": "gmail", "name": "Mail", "external_source_id": "mail@example"}
+    source = Source(
+        user_id=user.id,
+        type="gmail",
+        name="Mail",
+        status="active",
+        external_source_id="mail@example",
     )
+    db.add(source)
+    db.flush()
     db.add_all(
         [
             SourceFolder(source_id=source.id, external_folder_id="INBOX", name="Inbox"),
@@ -78,6 +84,14 @@ def test_source_folders(client, db, headers):
         client.patch(
             f"/api/v1/sources/{source.id}/folders",
             headers=headers,
+            json={"folders": [{"external_folder_id": "INBOX", "is_selected": False}]},
+        ).status_code
+        == 422
+    )
+    assert (
+        client.patch(
+            f"/api/v1/sources/{source.id}/folders",
+            headers=headers,
             json={"folders": [{"external_folder_id": "UNKNOWN", "is_selected": True}]},
         ).status_code
         == 422
@@ -86,9 +100,11 @@ def test_source_folders(client, db, headers):
 
 def test_inbox_transitions_and_reply_policy(client, db, headers):
     user = UserService(db).get_or_create(1001)
-    source = SourceService(db).create(
-        user, {"type": "gmail", "name": "Mail", "external_source_id": "mail"}
+    source = Source(
+        user_id=user.id, type="gmail", name="Mail", status="active", external_source_id="mail"
     )
+    db.add(source)
+    db.flush()
     email = Message(
         user_id=user.id,
         source_id=source.id,

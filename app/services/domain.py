@@ -289,10 +289,15 @@ class TaskService(OwnedService):
         return task, token
 
     def undo(
-        self, user: User, token: str, expected_task_id: uuid.UUID | None = None,
+        self,
+        user: User,
+        token: str,
+        expected_task_id: uuid.UUID | None = None,
         consumed_action: UIAction | None = None,
     ) -> Task:
-        action = consumed_action or UIActionService(self.db).consume(user, token, expected="undo_task")
+        action = consumed_action or UIActionService(self.db).consume(
+            user, token, expected="undo_task"
+        )
         if action.action != "undo_task":
             raise conflict("ACTION_TYPE_MISMATCH", "Unexpected action type")
         if expected_task_id and action.payload["task_id"] != str(expected_task_id):
@@ -368,6 +373,9 @@ class SourceService(OwnedService):
     model, label = Source, "source"
 
     def create(self, user: User, values: dict[str, Any]) -> Source:
+        if values["type"] in {"gmail", "yandex", "mailru"}:
+            raise AppError("OAUTH_REQUIRED", "Connect this mailbox through OAuth", 422)
+        is_imap = values["type"] == "imap"
         existing = None
         if values.get("external_source_id"):
             existing = self.db.scalar(
@@ -382,16 +390,18 @@ class SourceService(OwnedService):
             if existing.status != "disconnected":
                 raise conflict("SOURCE_ALREADY_CONNECTED", "Source is already connected")
             existing.name = values["name"]
-            existing.status = "active"
-            existing.connected_at = existing.last_analyzed_at = existing.last_synced_at = now
+            existing.status = "connecting" if is_imap else "active"
+            existing.connected_at = existing.last_analyzed_at = existing.last_synced_at = (
+                None if is_imap else now
+            )
             self.db.commit()
             return existing
         source = Source(
             user_id=user.id,
-            status="active",
-            connected_at=now,
-            last_analyzed_at=now,
-            last_synced_at=now,
+            status="connecting" if is_imap else "active",
+            connected_at=None if is_imap else now,
+            last_analyzed_at=None if is_imap else now,
+            last_synced_at=None if is_imap else now,
             **values,
         )
         self.db.add(source)
@@ -402,6 +412,17 @@ class SourceService(OwnedService):
         source = self.get(user, source_id)
         if source.status == "disconnected":
             raise conflict("SOURCE_DISCONNECTED", "Reconnect this source instead of editing it")
+        if (
+            source.type in {"gmail", "yandex", "mailru", "imap"}
+            and values.get("status") == "active"
+        ):
+            credential = self.db.scalar(
+                select(SourceCredential).where(SourceCredential.source_id == source.id)
+            )
+            if not credential or not (
+                credential.encrypted_access_token or credential.encrypted_password
+            ):
+                raise AppError("MAIL_NOT_CONFIGURED", "Mailbox credentials are missing", 422)
         for key, value in values.items():
             setattr(source, key, value)
         self.db.commit()
@@ -440,6 +461,9 @@ class SourceService(OwnedService):
                     "VALIDATION_ERROR", f"Unknown folder: {value['external_folder_id']}", 422
                 )
             folders[value["external_folder_id"]].is_selected = value["is_selected"]
+        if folders and not any(folder.is_selected for folder in folders.values()):
+            self.db.rollback()
+            raise AppError("VALIDATION_ERROR", "Select at least one folder", 422)
         self.db.commit()
         return list(folders.values())
 
@@ -537,7 +561,8 @@ class NotificationService(OwnedService):
         now = now or utcnow()
         created = 0
         for user, settings in self.db.execute(
-            select(User, UserSettings).join(UserSettings, UserSettings.user_id == User.id)
+            select(User, UserSettings)
+            .join(UserSettings, UserSettings.user_id == User.id)
             .where(User.is_active.is_(True))
         ):
             try:
@@ -545,7 +570,11 @@ class NotificationService(OwnedService):
             except ZoneInfoNotFoundError:
                 continue
             for kind, enabled, scheduled in (
-                ("morning_briefing", settings.morning_briefing_enabled, settings.morning_briefing_time),
+                (
+                    "morning_briefing",
+                    settings.morning_briefing_enabled,
+                    settings.morning_briefing_time,
+                ),
                 ("evening_stats", settings.evening_stats_enabled, settings.evening_stats_time),
             ):
                 scheduled_minutes = scheduled.hour * 60 + scheduled.minute
@@ -567,8 +596,10 @@ class NotificationService(OwnedService):
         client = client or TelegramClient()
         sent = 0
         notifications = self.db.scalars(
-            select(Notification).where(Notification.status == "pending")
-            .order_by(Notification.created_at).limit(100)
+            select(Notification)
+            .where(Notification.status == "pending")
+            .order_by(Notification.created_at)
+            .limit(100)
         ).all()
         for notification in notifications:
             user = self.db.get(User, notification.user_id)
@@ -642,8 +673,10 @@ class CalendarService(OwnedService):
         api = GoogleCalendarAPI(self.db)
         synced = 0
         events = self.db.scalars(
-            select(CalendarEvent).where(CalendarEvent.status == "pending")
-            .order_by(CalendarEvent.created_at).limit(limit)
+            select(CalendarEvent)
+            .where(CalendarEvent.status == "pending")
+            .order_by(CalendarEvent.created_at)
+            .limit(limit)
         ).all()
         for event in events:
             connection = self.db.get(CalendarConnection, event.connection_id)

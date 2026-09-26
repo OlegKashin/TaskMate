@@ -87,6 +87,19 @@ class EmailService:
         source.external_source_id = username
         source.status = "active"
         source.connected_at = source.last_synced_at = source.last_analyzed_at = utcnow()
+        if not self.db.scalar(
+            select(SourceFolder).where(
+                SourceFolder.source_id == source.id, SourceFolder.external_folder_id == "INBOX"
+            )
+        ):
+            self.db.add(
+                SourceFolder(
+                    source_id=source.id,
+                    external_folder_id="INBOX",
+                    name="Входящие",
+                    is_selected=True,
+                )
+            )
         self.db.commit()
         return {"source_id": str(source.id), "status": source.status}
 
@@ -96,6 +109,9 @@ class EmailService:
         since = source.last_synced_at or source.connected_at
         if since is None:
             raise AppError("MAIL_NOT_CONFIGURED", "Mailbox has no connection time", 503)
+        # A message arriving while pages are being fetched must remain eligible
+        # for the next poll, even if this poll did not see it yet.
+        sync_started_at = utcnow()
         folders = list(
             self.db.scalars(
                 select(SourceFolder).where(
@@ -165,7 +181,7 @@ class EmailService:
                     attachment.checksum = checksum
                     self.db.add(attachment)
             count += 1
-        source.last_synced_at = utcnow()
+        source.last_synced_at = sync_started_at
         self.db.commit()
         return count
 

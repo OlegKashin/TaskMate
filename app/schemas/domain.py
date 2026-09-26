@@ -77,6 +77,10 @@ class EmailReply(BaseModel):
     draft_text: str = Field(min_length=1)
 
 
+class ConfirmationToken(BaseModel):
+    token: str = Field(min_length=1)
+
+
 class IMAPCredentials(BaseModel):
     username: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=1)

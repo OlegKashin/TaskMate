@@ -19,6 +19,7 @@ from app.models.entities import (
     OAuthState,
     Source,
     SourceCredential,
+    SourceFolder,
     User,
     utcnow,
 )
@@ -73,14 +74,23 @@ class OAuthService:
         if provider == "google":
             draft = CalendarConnection(user_id=user.id, provider="google", status="connecting")
         elif provider == "mailru":
-            draft = self.db.scalar(select(Source).where(
-                Source.user_id == user.id, Source.type == provider,
-                Source.external_source_id == account_email))
+            draft = self.db.scalar(
+                select(Source).where(
+                    Source.user_id == user.id,
+                    Source.type == provider,
+                    Source.external_source_id == account_email,
+                )
+            )
             if draft:
                 draft.status = "connecting"
             else:
-                draft = Source(user_id=user.id, type=provider, status="connecting",
-                               name=account_email, external_source_id=account_email)
+                draft = Source(
+                    user_id=user.id,
+                    type=provider,
+                    status="connecting",
+                    name=account_email,
+                    external_source_id=account_email,
+                )
         else:
             draft = Source(
                 user_id=user.id,
@@ -160,7 +170,11 @@ class OAuthService:
         }
         try:
             response = httpx.get(
-                urls[provider], headers={"Authorization": f"{'OAuth' if provider == 'yandex' else 'Bearer'} {access_token}"}, timeout=15
+                urls[provider],
+                headers={
+                    "Authorization": f"{'OAuth' if provider == 'yandex' else 'Bearer'} {access_token}"
+                },
+                timeout=15,
             )
             response.raise_for_status()
             profile = response.json()
@@ -283,12 +297,28 @@ class OAuthService:
             if tokens.get("refresh_token"):
                 credential.encrypted_refresh_token = box.encrypt(tokens["refresh_token"])
             credential.token_expires_at = expires_at
+            if not self.db.scalar(
+                select(SourceFolder).where(
+                    SourceFolder.source_id == source.id, SourceFolder.external_folder_id == "INBOX"
+                )
+            ):
+                self.db.add(
+                    SourceFolder(
+                        source_id=source.id,
+                        external_folder_id="INBOX",
+                        name="Входящие",
+                        is_selected=True,
+                    )
+                )
             result = source
         notification = Notification(
             user_id=state.user_id,
             type="oauth_connected",
-            payload={"title": f"Источник {account} подключён" if provider != "google"
-                     else "Google Calendar подключён"},
+            payload={
+                "title": f"Источник {account} подключён"
+                if provider != "google"
+                else "Google Calendar подключён"
+            },
             dedupe_key=f"oauth-connected:{state.id}",
         )
         self.db.add(notification)
@@ -305,14 +335,21 @@ class OAuthService:
         return result
 
     def fail(self, provider: str, state_token: str) -> None:
-        state = self.db.scalar(select(OAuthState).where(
-            OAuthState.provider == provider, OAuthState.state_token == state_token,
-            OAuthState.consumed_at.is_(None), OAuthState.expires_at > utcnow()))
+        state = self.db.scalar(
+            select(OAuthState).where(
+                OAuthState.provider == provider,
+                OAuthState.state_token == state_token,
+                OAuthState.consumed_at.is_(None),
+                OAuthState.expires_at > utcnow(),
+            )
+        )
         if not state:
             raise AppError("AUTH_ERROR", "Invalid or consumed OAuth state", 401)
         state.consumed_at = utcnow()
-        draft = self.db.get(CalendarConnection if provider == "google" else Source,
-                            state.calendar_connection_id if provider == "google" else state.source_id)
+        draft = self.db.get(
+            CalendarConnection if provider == "google" else Source,
+            state.calendar_connection_id if provider == "google" else state.source_id,
+        )
         if draft:
             draft.status = "error"
         self.db.commit()

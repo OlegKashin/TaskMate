@@ -14,6 +14,7 @@ from app.models.entities import (
 )
 from app.schemas.domain import (
     AnalyzeRequest,
+    ConfirmationToken,
     EmailReply,
     EventCreate,
     EventPatch,
@@ -233,8 +234,13 @@ def reply_inbox(object_id: uuid.UUID, payload: EmailReply, db: DB, user: Current
 
 
 @router.post("/inbox/replies/confirm")
-def confirm_email_reply(token: str, db: DB, user: CurrentUser):
-    return ok({"status": "sent", "external_message_id": EmailService(db).confirm_reply(user, token)})
+def confirm_email_reply(payload: ConfirmationToken, db: DB, user: CurrentUser):
+    return ok(
+        {
+            "status": "sent",
+            "external_message_id": EmailService(db).confirm_reply(user, payload.token),
+        }
+    )
 
 
 @router.post("/sources/{object_id}/sync")

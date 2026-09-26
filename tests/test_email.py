@@ -375,11 +375,46 @@ def test_mailru_oauth_verifies_claimed_mailbox(db, monkeypatch):
     monkeypatch.setattr(oauth_module.imaplib, "IMAP4_SSL", Mock(return_value=imap))
     source = service.complete("mailru", state.state_token, "code")
     assert source.status == "active" and source.external_source_id == "owner@mail.ru"
+    assert (
+        db.scalar(
+            select(SourceFolder).where(SourceFolder.source_id == source.id)
+        ).external_folder_id
+        == "INBOX"
+    )
     assert b"owner@mail.ru" in imap.authenticate.call_args.args[1](None)
     credential = db.scalar(select(SourceCredential).where(SourceCredential.source_id == source.id))
     assert SecretBox().decrypt(credential.encrypted_access_token) == "provider-token"
     with pytest.raises(AppError):
         service.complete("mailru", state.state_token, "code")
+    get_settings.cache_clear()
+
+
+def test_yandex_profile_uses_oauth_header(db, monkeypatch):
+    import app.services.oauth as oauth_module
+
+    get = Mock(return_value=response({"default_email": "owner@yandex.ru", "id": "42"}))
+    monkeypatch.setattr(oauth_module.httpx, "get", get)
+    assert OAuthService(db)._account_id("yandex", "token") == "owner@yandex.ru"
+    assert get.call_args.kwargs["headers"] == {"Authorization": "OAuth token"}
+
+
+def test_oauth_denial_marks_connecting_source_error(client, db, headers, monkeypatch):
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "my-app")
+    monkeypatch.setenv("GMAIL_CLIENT_SECRET", "my-secret")
+    get_settings.cache_clear()
+    created = client.post("/api/v1/oauth/gmail/states", headers=headers).json()["data"]
+    result = client.get(
+        "/api/v1/oauth/gmail/callback", params={"state": created["state"], "error": "access_denied"}
+    )
+    assert result.status_code == 400 and "Подключение отменено" in result.text
+    source = db.scalar(select(Source).where(Source.type == "gmail"))
+    assert source.status == "error"
+    assert (
+        client.get(
+            "/api/v1/oauth/gmail/callback", params={"state": created["state"], "code": "late"}
+        ).status_code
+        == 401
+    )
     get_settings.cache_clear()
 
 
@@ -432,3 +467,63 @@ def test_worker_imports_then_queues_ai_job(db, monkeypatch):
         select(Message).where(Message.external_message_id == "<worker@example.com>")
     )
     assert message.processing_status == "queued"
+
+
+def test_reply_api_draft_confirm_and_replay(client, db, headers, monkeypatch):
+    import app.services.email as service_module
+
+    user = UserService(db).get_or_create(1001)
+    source, _ = mail_source(db, user)
+    message = Message(
+        user_id=user.id,
+        source_id=source.id,
+        external_message_id="api-email",
+        message_type="email",
+        sender_email="alice@example.com",
+        subject="Question",
+        text="Hi",
+        received_at=datetime.now(UTC),
+    )
+    db.add(message)
+    db.flush()
+    item = InboxItem(user_id=user.id, message_id=message.id, item_type="reply_required")
+    db.add(item)
+    db.commit()
+    send = Mock(return_value="sent")
+    monkeypatch.setattr(service_module, "send_reply", send)
+    draft = client.post(
+        f"/api/v1/inbox/{item.id}/reply", headers=headers, json={"draft_text": "Thanks"}
+    )
+    assert draft.status_code == 200 and send.call_count == 0
+    token = draft.json()["data"]["confirmation_token"]
+    confirmed = client.post("/api/v1/inbox/replies/confirm", headers=headers, json={"token": token})
+    assert confirmed.json()["data"]["external_message_id"] == "sent"
+    assert send.call_count == 1
+    assert (
+        client.post(
+            "/api/v1/inbox/replies/confirm", headers=headers, json={"token": token}
+        ).status_code
+        == 409
+    )
+
+
+def test_mail_sources_cannot_be_activated_without_credentials(client, headers):
+    denied = client.post(
+        "/api/v1/sources",
+        headers=headers,
+        json={"type": "gmail", "name": "Gmail", "external_source_id": "owner@example.com"},
+    )
+    assert denied.status_code == 422
+    imap = client.post(
+        "/api/v1/sources",
+        headers=headers,
+        json={"type": "imap", "name": "Custom", "external_source_id": "owner@example.com"},
+    )
+    assert imap.status_code == 201 and imap.json()["data"]["status"] == "connecting"
+    source_id = imap.json()["data"]["id"]
+    assert (
+        client.patch(
+            f"/api/v1/sources/{source_id}", headers=headers, json={"status": "active"}
+        ).status_code
+        == 422
+    )

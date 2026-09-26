@@ -16,8 +16,53 @@ from app.schemas.domain import AIResult
 from app.services.analysis import queue_source_analysis
 from app.services.domain import SourceService, TaskService, UIActionService, UserService, utcnow
 from app.services.email import EmailService
+from app.services.oauth import OAuthService
 
 router = APIRouter()
+
+
+def email_connect_menu(db, user):
+    actions = UIActionService(db)
+    labels = (
+        ("gmail", "Gmail"),
+        ("yandex", "Яндекс.Почта"),
+        ("mailru", "Mail.ru"),
+        ("imap", "Другой IMAP"),
+    )
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": label,
+                    "callback_data": actions.create(
+                        user, "connect_provider", {"provider": provider}
+                    ),
+                }
+                for provider, label in labels[:2]
+            ],
+            [
+                {
+                    "text": label,
+                    "callback_data": actions.create(
+                        user, "connect_provider", {"provider": provider}
+                    ),
+                }
+                for provider, label in labels[2:]
+            ],
+        ]
+    }
+
+
+def send_oauth_link(db, user, chat_id: int, provider: str):
+    service = OAuthService(db)
+    state = service.create_state(user, provider)
+    url = service.authorize_url(provider, state.state_token)
+    TelegramClient().send_message(
+        chat_id,
+        "Откройте ссылку для подключения аккаунта:",
+        {"inline_keyboard": [[{"text": "Подключить", "url": url}]]},
+    )
+    return state
 
 
 @router.post("/webhooks/telegram")
@@ -80,14 +125,55 @@ def telegram_webhook(
             return {"ok": True, "undone": str(task.id)}
         if action.action == "navigate":
             section = action.payload["section"]
-            client.send_message(chat_id, section_message(db, user, section))
+            client.send_message(
+                chat_id,
+                section_message(db, user, section),
+                email_connect_menu(db, user)
+                if section == "sources"
+                and callback_message.get("chat", {}).get("type") == "private"
+                else None,
+            )
             client.answer_callback(callback.get("id"))
             db.commit()
             return {"ok": True, "section": section}
+        if action.action == "connect_provider":
+            if callback_message.get("chat", {}).get("type") != "private":
+                client.answer_callback(callback.get("id"), "Откройте меню в личном чате с ботом")
+                db.commit()
+                return {"ok": True, "ignored": True}
+            provider = action.payload["provider"]
+            if provider in {"gmail", "yandex"}:
+                try:
+                    send_oauth_link(db, user, chat_id, provider)
+                except AppError as exc:
+                    client.send_message(chat_id, f"Не удалось начать подключение: {exc.message}")
+            elif provider == "mailru":
+                client.send_message(chat_id, "Укажите адрес ящика: /connect_mailru <email>")
+            else:
+                client.send_message(
+                    chat_id,
+                    "Для другого IMAP создайте источник через API и укажите app password в /sources/{id}/imap-credentials. Получить API-токен: /api_token",
+                )
+            client.answer_callback(callback.get("id"))
+            db.commit()
+            return {"ok": True, "provider": provider}
         if action.action == "send_email":
             # The callback action is already claimed by UIActionService.consume.
             db.commit()
-            sent = EmailService(db).send_consumed_reply(user, action)
+            try:
+                sent = EmailService(db).send_consumed_reply(user, action)
+            except AppError as exc:
+                client.send_message(
+                    chat_id,
+                    (
+                        "Не удалось подтвердить отправку. Проверьте исходящие письма перед повтором. "
+                        f"Черновик: {action.payload['draft_text'][:2000]}\n"
+                        f"Новый ответ: /reply {action.payload['message_id']} <текст>. "
+                        f"Причина: {exc.message}"
+                    ),
+                )
+                client.answer_callback(callback.get("id"))
+                return {"ok": True, "sent": False, "error": exc.code}
             client.send_message(chat_id, "Ответ отправлен.")
             client.answer_callback(callback.get("id"))
             return {"ok": True, "sent": sent}
@@ -98,14 +184,19 @@ def telegram_webhook(
                 pass
             response = (
                 f"Напишите новый ответ командой /reply {action.payload['message_id']} <текст>"
-                if action.action == "edit_email" else "Отправка ответа отменена."
+                if action.action == "edit_email"
+                else "Отправка ответа отменена."
             )
             client.send_message(chat_id, response)
             client.answer_callback(callback.get("id"))
             db.commit()
             return {"ok": True, "action": action.action}
         if action.action in {"cancel_ai", "edit_ai"}:
-            response = "Действие отменено." if action.action == "cancel_ai" else "Напишите исправленный запрос новым сообщением."
+            response = (
+                "Действие отменено."
+                if action.action == "cancel_ai"
+                else "Напишите исправленный запрос новым сообщением."
+            )
             if message_id:
                 client.edit_message(chat_id, message_id, response)
             else:
@@ -133,6 +224,29 @@ def telegram_webhook(
     chat_id = chat.get("id", tg_id)
     command = (message_data.get("text") or "").split(maxsplit=1)[0].lower()
     command = command.split("@", 1)[0]
+    if command == "/connect" and chat.get("type") == "private":
+        TelegramClient().send_message(chat_id, "Подключить почту:", email_connect_menu(db, user))
+        db.commit()
+        return {"ok": True, "command": "connect"}
+    if command == "/connect_mailru" and chat.get("type") == "private":
+        parts = (message_data.get("text") or "").split(maxsplit=1)
+        if len(parts) != 2:
+            TelegramClient().send_message(chat_id, "Укажите адрес: /connect_mailru <email>")
+            db.commit()
+            return {"ok": True, "command": "connect_mailru"}
+        try:
+            service = OAuthService(db)
+            state = service.create_state(user, "mailru", parts[1].strip())
+            url = service.authorize_url("mailru", state.state_token)
+            TelegramClient().send_message(
+                chat_id,
+                "Откройте ссылку для подключения Mail.ru:",
+                {"inline_keyboard": [[{"text": "Подключить", "url": url}]]},
+            )
+        except AppError as exc:
+            TelegramClient().send_message(chat_id, f"Не удалось начать подключение: {exc.message}")
+        db.commit()
+        return {"ok": True, "command": "connect_mailru"}
     if command == "/reply" and chat.get("type") == "private":
         args = (message_data.get("text") or "").split(maxsplit=2)
         if len(args) < 3:
@@ -142,10 +256,16 @@ def telegram_webhook(
         except ValueError as exc:
             raise AppError("VALIDATION_ERROR", "Invalid message ID", 422) from exc
         token = EmailService(db).draft_for_message(user, target, args[2])
-        text, markup = outcome_message(db, user, {
-            "state": "email_draft", "token": token,
-            "message_id": str(target), "draft_text": args[2],
-        })
+        text, markup = outcome_message(
+            db,
+            user,
+            {
+                "state": "email_draft",
+                "token": token,
+                "message_id": str(target),
+                "draft_text": args[2],
+            },
+        )
         TelegramClient().send_message(chat_id, text, markup)
         db.commit()
         return {"ok": True, "draft": True}
@@ -155,18 +275,28 @@ def telegram_webhook(
             TelegramClient().send_message(chat_id, "Подключить группу может только администратор.")
             db.commit()
             return {"ok": True, "connected": False}
-        existing = db.scalar(select(Source).where(
-            Source.user_id == user.id, Source.type == "telegram_group",
-            Source.external_source_id == str(chat_id)))
+        existing = db.scalar(
+            select(Source).where(
+                Source.user_id == user.id,
+                Source.type == "telegram_group",
+                Source.external_source_id == str(chat_id),
+            )
+        )
         if existing and existing.status == "active":
             TelegramClient().send_message(chat_id, "Группа уже подключена.")
             db.commit()
             return {"ok": True, "connected": True, "source_id": str(existing.id)}
-        source = SourceService(db).create(user, {
-            "type": "telegram_group", "name": chat.get("title") or "Telegram group",
-            "external_source_id": str(chat_id),
-        })
-        TelegramClient().send_message(chat_id, "Группа подключена. Новые сообщения будут анализироваться.")
+        source = SourceService(db).create(
+            user,
+            {
+                "type": "telegram_group",
+                "name": chat.get("title") or "Telegram group",
+                "external_source_id": str(chat_id),
+            },
+        )
+        TelegramClient().send_message(
+            chat_id, "Группа подключена. Новые сообщения будут анализироваться."
+        )
         return {"ok": True, "connected": True, "source_id": str(source.id)}
     if command.startswith("/") and chat.get("type") != "private":
         db.commit()
@@ -174,7 +304,9 @@ def telegram_webhook(
     if command == "/api_token":
         if chat.get("type") != "private":
             return {"ok": True, "ignored": True}
-        TelegramClient().send_message(chat_id, f"Ваш API token (24 часа):\n{issue_user_token(tg_id)}")
+        TelegramClient().send_message(
+            chat_id, f"Ваш API token (24 часа):\n{issue_user_token(tg_id)}"
+        )
         db.commit()
         return {"ok": True, "command": "api_token"}
     if command in {"/start", "/menu"}:
@@ -202,7 +334,8 @@ def telegram_webhook(
         if command == "/analyze":
             analysis = queue_source_analysis(db, user)
             response = (
-                "Пока нет подключённых источников для анализа." if analysis["status"] == "no_sources"
+                "Пока нет подключённых источников для анализа."
+                if analysis["status"] == "no_sources"
                 else f"Анализ запущен для сообщений: {analysis['queued']}"
             )
             if analysis.get("external_sync") == "queued":
@@ -223,7 +356,8 @@ def telegram_webhook(
     }.get(chat_type, "telegram_chat")
     external_id = str(chat.get("id", tg_id))
     source_query = select(Source).where(
-        Source.type == source_type, Source.external_source_id == external_id)
+        Source.type == source_type, Source.external_source_id == external_id
+    )
     if chat_type == "private":
         source_query = source_query.where(Source.user_id == user.id)
     source = db.scalar(source_query.order_by(Source.connected_at.desc()))
@@ -247,7 +381,9 @@ def telegram_webhook(
     is_voice = "voice" in message_data
     has_attachment = any(key in message_data for key in ("voice", "photo", "document"))
     if (is_voice and not source.analysis_voice and not source.save_attachments) or (
-        not is_voice and not source.analysis_text and not (has_attachment and source.save_attachments)
+        not is_voice
+        and not source.analysis_text
+        and not (has_attachment and source.save_attachments)
     ):
         db.commit()
         return {"ok": True, "ignored": True, "reason": "source_analysis_disabled"}
@@ -287,13 +423,19 @@ def telegram_webhook(
     job = AIProcessingJob(
         user_id=user.id,
         message_id=message.id,
-        job_type="stt" if is_voice and needs_ai else ("interpret" if needs_ai else "attachment_only"),
+        job_type="stt"
+        if is_voice and needs_ai
+        else ("interpret" if needs_ai else "attachment_only"),
         status="queued",
     )
     status_message = TelegramClient().send_message(
         chat_id,
-        "🎙 Обрабатываю голосовое..." if is_voice else (
-            "📎 Сохраняю вложение..." if has_attachment and not text else "🤔 Анализирую сообщение..."
+        "🎙 Обрабатываю голосовое..."
+        if is_voice
+        else (
+            "📎 Сохраняю вложение..."
+            if has_attachment and not text
+            else "🤔 Анализирую сообщение..."
         ),
     )
     if status_message:
