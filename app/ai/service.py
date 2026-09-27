@@ -2,6 +2,7 @@ import re
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -41,8 +42,66 @@ class LLMProvider(Protocol):
 class RuleBasedProvider:
     """Offline-safe provider used for development and deterministic tests."""
 
+    def __init__(self, timezone: str = "UTC"):
+        self.timezone = timezone
+
+    def _due_at(self, lowered: str) -> str | None:
+        try:
+            zone = ZoneInfo(self.timezone)
+        except ZoneInfoNotFoundError:
+            zone = UTC
+        local = datetime.now(zone)
+        days = None
+        if "завтра" in lowered or "tomorrow" in lowered:
+            days = 1
+        elif "сегодня" in lowered or "today" in lowered:
+            days = 0
+        else:
+            weekdays = {
+                "понедельник": 0, "вторник": 1, "сред": 2, "четверг": 3,
+                "пятниц": 4, "суббот": 5, "воскресень": 6,
+            }
+            for stem, weekday in weekdays.items():
+                if stem in lowered:
+                    days = (weekday - local.weekday()) % 7
+                    if days == 0 and local.hour >= 18:
+                        days = 7
+                    break
+        if days is None:
+            return None
+        due = (local + timedelta(days=days)).replace(hour=18, minute=0, second=0, microsecond=0)
+        return due.isoformat()
+
     async def interpret(self, text: str) -> AIResult:
         raw, lowered = text.strip(), text.lower()
+        if re.match(r"^(найди|найдите|поищи|покажи|search)\b", lowered) and "задач" in lowered:
+            query = re.sub(
+                r"^(?:найди|найдите|поищи|покажи|search)\s+задач[ауие]*\s*(?:про|по)?\s*",
+                "", raw, flags=re.I,
+            ).strip()
+            return AIResult(
+                intent="search_task", confidence=0.9, entities={"query": query},
+                action=AIAction(type="search_task", requires_confirmation=False),
+                reason="Detected task search",
+            )
+        if re.match(r"^(перенеси|измени|удали|отметь|заверши|выполни)\b", lowered):
+            quoted = re.search(r"[«\"]([^»\"]+)[»\"]", raw)
+            target = {"search_hint": {"title_contains": quoted.group(1)}} if quoted else None
+            if lowered.startswith("удали"):
+                intent, entities = "delete_task", {"target": target} if target else {}
+            elif lowered.startswith(("отметь", "заверши", "выполни")):
+                intent = "change_task_status"
+                entities = {"target": target, "new_status": "completed"} if target else {}
+            else:
+                intent = "edit_task"
+                due_at = self._due_at(lowered)
+                entities = {"target": target, "changed_fields": {"due_at": due_at}} if target and due_at else {}
+            complete = bool(entities)
+            return AIResult(
+                intent=intent, confidence=0.9 if complete else 0.3, entities=entities,
+                action=AIAction(type=intent),
+                reason="Уточните задачу и новое значение." if not complete else "Detected task change",
+            )
         if any(word in lowered for word in ("напомни", "remind")):
             return AIResult(
                 intent="reminder",
@@ -66,10 +125,14 @@ class RuleBasedProvider:
             word in lowered for word in ("задач", "сделать", "todo", "отправить", "подготовить")
         ):
             title = re.sub(r"^(создай\s+)?задач[ауи]?\s*", "", raw, flags=re.I) or raw
+            due_at = self._due_at(lowered)
+            entities = {"title": title, "priority": "normal"}
+            if due_at:
+                entities["due_at"] = due_at
             return AIResult(
                 intent="create_task",
                 confidence=0.9,
-                entities={"title": title, "priority": "normal"},
+                entities=entities,
                 action=AIAction(type="create_task"),
                 reason="Detected task command",
             )
@@ -89,6 +152,41 @@ class AIActionService:
     def apply(self, user: User, result: AIResult, message: Message | None = None):
         if result.confidence < 0.60:
             return {"state": "clarification", "reason": result.reason}
+        if (
+            result.intent == "create_task" and message
+            and "project_id" not in result.entities
+            and not result.entities.get("project_hint")
+        ):
+            projects = SourceService(self.db).projects(user, message.source_id)
+            if len(projects) > 1:
+                return {
+                    "state": "project_choice",
+                    "candidates": [{"id": str(project.id), "name": project.name}
+                                   for project in projects],
+                    "result": result.model_dump(mode="json"),
+                    "message_id": str(message.id),
+                }
+            result = result.model_copy(update={
+                "entities": {**result.entities,
+                             "project_id": str(projects[0].id) if projects else None},
+            })
+        if result.intent in {"edit_task", "delete_task", "change_task_status"}:
+            try:
+                target = self._target_task(user, result.entities["target"])
+            except AppError as exc:
+                if exc.status_code == 404:
+                    return {"state": "clarification", "reason": "Не нашёл задачу. Уточните название."}
+                raise
+            if isinstance(target, list):
+                return {
+                    "state": "clarification", "reason": "Выберите задачу:",
+                    "candidates": [{"id": str(task.id), "title": task.title} for task in target],
+                    "result": result.model_dump(mode="json"),
+                    "message_id": str(message.id) if message else None,
+                }
+            result = result.model_copy(update={
+                "entities": {**result.entities, "target": {"task_id": str(target.id)}},
+            })
         if result.intent == "create_event" and not result.entities.get("connection_id"):
             active_calendar = self.db.scalar(select(CalendarConnection.id).where(
                 CalendarConnection.user_id == user.id,
@@ -149,6 +247,11 @@ class AIActionService:
                 if entities.get(key) is not None
             }
             values.setdefault("priority", "normal")
+            if "project_id" in entities:
+                values["project_id"] = (
+                    uuid.UUID(str(entities["project_id"]))
+                    if entities["project_id"] else None
+                )
             if isinstance(values.get("due_at"), str):
                 values["due_at"] = datetime.fromisoformat(values["due_at"])
             hint = entities.get("project_hint")
@@ -280,7 +383,32 @@ class AIActionService:
             token = EmailService(self.db).draft_for_message(user, target, entities["draft_text"])
             return {"state": "email_draft", "token": token,
                     "message_id": str(target), "draft_text": entities["draft_text"]}
-        if result.intent in {"search_task", "show_today", "show_schedule", "show_stats", "search_event", "analyze"}:
+        if result.intent == "search_task":
+            filters = entities.get("filters") or {}
+            due_from = filters.get("due_from")
+            due_to = filters.get("due_to")
+            if isinstance(due_from, str):
+                due_from = datetime.fromisoformat(due_from)
+            if isinstance(due_to, str):
+                due_to = datetime.fromisoformat(due_to)
+            project_id = None
+            if filters.get("project_hint"):
+                from app.models.entities import Project
+
+                projects = self.db.scalars(select(Project).where(
+                    Project.user_id == user.id, Project.is_archived.is_(False),
+                    Project.name.ilike(f"%{filters['project_hint']}%"),
+                ).limit(2)).all()
+                if len(projects) != 1:
+                    return {"state": "clarification", "reason": "Уточните проект для поиска."}
+                project_id = projects[0].id
+            tasks, _ = TaskService(self.db).list_filtered(
+                user, limit=20, status=filters.get("status"), project_id=project_id,
+                due_from=due_from, due_to=due_to, search=entities.get("query"),
+            )
+            return {"state": "search_results", "query": entities.get("query") or "",
+                    "tasks": [{"id": str(task.id), "title": task.title} for task in tasks]}
+        if result.intent in {"show_today", "show_schedule", "show_stats", "search_event", "analyze"}:
             return {"state": "informational", "intent": result.intent, "entities": entities}
         return {"state": "informational", "reason": result.reason}
 
@@ -316,6 +444,8 @@ class AIService:
                     f"Subject: {message.subject or ''}\n"
                     f"Body:\n{input_text}"
                 )
+            if hasattr(self.provider, "timezone"):
+                self.provider.timezone = user.timezone
             result = await self.provider.interpret(input_text)
             outcome = AIActionService(self.db).apply(user, result, message)
             job.result, job.status, message.processing_status = (
@@ -372,7 +502,11 @@ class AIService:
                         Notification(
                             user_id=user.id,
                             type="urgent_item",
-                            payload={"message_id": str(message.id)},
+                            payload={
+                                "message_id": str(message.id),
+                                "title": "🔴 Срочно\n"
+                                + (message.subject or message.text or "Новое сообщение")[:500],
+                            },
                             dedupe_key=f"urgent:{message.id}",
                         )
                     )

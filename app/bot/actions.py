@@ -5,8 +5,16 @@ from datetime import timedelta
 
 from sqlalchemy import select
 
+from app.bot.manual import edit_task_draft, handle_task_draft_action
 from app.bot.presentation import outcome_message
-from app.bot.views import _button, folders_view, inbox_view, object_view, section_view
+from app.bot.views import (
+    _button,
+    folders_view,
+    inbox_view,
+    object_view,
+    section_view,
+    source_projects_view,
+)
 from app.core.errors import AppError
 from app.models.entities import Message, Project, UserSettings
 from app.services.domain import (
@@ -26,11 +34,26 @@ ACTIONS = {
     "source_toggle", "source_disconnect_prompt", "source_disconnect",
     "folder_show", "folder_refresh", "folder_toggle", "setting_toggle",
     "setting_times", "setting_projects", "setting_project",
+    "source_projects_view", "source_project_toggle",
+    "task_new_prompt", "task_draft_create", "task_draft_due",
+    "task_draft_project", "task_draft_priority", "task_draft_set_project",
+    "task_draft_set_priority", "task_edit_prompt", "task_complete_prompt",
+    "project_new_prompt", "project_create_confirm", "project_rename_prompt",
+    "project_delete_prompt", "project_delete",
 }
 
 
 def handle_action(db, user, action) -> tuple[str, dict | None]:
     kind, payload = action.action, action.payload
+    if kind == "task_new_prompt":
+        return "Напишите: /task <название задачи>", None
+    if kind.startswith("task_draft_"):
+        return handle_task_draft_action(db, user, kind, payload["draft"], payload)
+    if kind == "project_new_prompt":
+        return "Напишите: /project <название проекта>", None
+    if kind == "project_create_confirm":
+        project = ProjectService(db).create(user, {"name": payload["name"]})
+        return f"Проект «{project.name}» создан.", None
     if kind == "inbox_open":
         return inbox_view(db, user, uuid.UUID(payload["id"]))
     if kind in {"tasks_open", "projects_open", "sources_open", "schedule_open"}:
@@ -99,6 +122,15 @@ def handle_action(db, user, action) -> tuple[str, dict | None]:
     if kind == "task_complete":
         task, undo = TaskService(db).change_status(user, uuid.UUID(payload["id"]), "completed")
         return outcome_message(db, user, {"state": "executed", "object_id": str(task.id), "undo": undo})
+    if kind == "task_complete_prompt":
+        task = TaskService(db).get(user, uuid.UUID(payload["id"]))
+        return f"Отметить задачу «{task.title}» выполненной?", {"inline_keyboard": [[
+            _button(db, user, "Да, выполнено", "task_complete", {"id": str(task.id)}),
+            _button(db, user, "Не сейчас", "tasks_open", {"id": str(task.id)}),
+        ]]}
+    if kind == "task_edit_prompt":
+        text, markup = edit_task_draft(db, user, uuid.UUID(payload["id"]))
+        return text + f"\nНазвание: /task_edit {payload['id']} <новое название>", markup
     if kind == "task_delete_prompt":
         task = TaskService(db).get(user, uuid.UUID(payload["id"]))
         return f"Удалить задачу «{task.title}»?", {"inline_keyboard": [[
@@ -111,6 +143,21 @@ def handle_action(db, user, action) -> tuple[str, dict | None]:
     if kind == "project_archive":
         project = ProjectService(db).patch(user, uuid.UUID(payload["id"]), {"is_archived": True})
         return f"Проект «{project.name}» архивирован.", None
+    if kind == "project_rename_prompt":
+        project = ProjectService(db).get(user, uuid.UUID(payload["id"]))
+        return f"Чтобы переименовать «{project.name}», напишите: /project_rename {project.id} <новое название>", None
+    if kind == "project_delete_prompt":
+        project = ProjectService(db).get(user, uuid.UUID(payload["id"]))
+        return (f"Удалить проект «{project.name}»? Задачи сохранятся в Inbox. "
+                "Это действие нельзя отменить."), {"inline_keyboard": [[
+            _button(db, user, "Да, удалить", "project_delete", {"id": str(project.id)}),
+            _button(db, user, "Не удалять", "projects_open", {"id": str(project.id)}),
+        ]]}
+    if kind == "project_delete":
+        project = ProjectService(db).get(user, uuid.UUID(payload["id"]))
+        name = project.name
+        ProjectService(db).delete(user, project.id)
+        return f"Проект «{name}» удалён. Задачи сохранены в Inbox.", None
     if kind == "source_toggle":
         source = SourceService(db).get(user, uuid.UUID(payload["id"]))
         source = SourceService(db).patch(user, source.id, {
@@ -126,6 +173,18 @@ def handle_action(db, user, action) -> tuple[str, dict | None]:
     if kind == "source_disconnect":
         source = SourceService(db).disconnect(user, uuid.UUID(payload["id"]))
         return f"Источник «{source.name}» отключён. Сохранённые данные остались.", None
+    if kind == "source_projects_view":
+        return source_projects_view(db, user, uuid.UUID(payload["id"]))
+    if kind == "source_project_toggle":
+        source_id = uuid.UUID(payload["id"])
+        project_id = uuid.UUID(payload["project_id"])
+        current = {project.id for project in SourceService(db).projects(user, source_id)}
+        if project_id in current:
+            current.remove(project_id)
+        else:
+            current.add(project_id)
+        SourceService(db).replace_projects(user, source_id, list(current))
+        return source_projects_view(db, user, source_id)
     if kind == "folder_refresh":
         source_id = uuid.UUID(payload["id"])
         try:

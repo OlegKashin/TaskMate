@@ -35,6 +35,11 @@ class GoogleCalendarAPI:
                     "refresh_token": box.decrypt(connection.encrypted_refresh_token),
                     "grant_type": "refresh_token",
                 }, timeout=15)
+                if response.status_code == 401 or (
+                    response.status_code == 400
+                    and response.json().get("error") == "invalid_grant"
+                ):
+                    raise AppError("CALENDAR_RECONNECT_REQUIRED", "Reconnect Google Calendar", 409)
                 response.raise_for_status()
                 tokens = response.json()
                 access_token = tokens["access_token"]

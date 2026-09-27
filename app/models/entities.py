@@ -15,6 +15,7 @@ from sqlalchemy import (
     Time,
     UniqueConstraint,
     Uuid,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -72,7 +73,14 @@ class Project(UUIDMixin, TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(255))
     description: Mapped[str | None] = mapped_column(Text)
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False)
-    __table_args__ = (Index("ix_projects_user_name", "user_id", "name"),)
+    __table_args__ = (
+        Index("ix_projects_user_name", "user_id", "name"),
+        Index(
+            "ux_projects_user_name_active", "user_id", "name", unique=True,
+            postgresql_where=text("is_archived = false"),
+            sqlite_where=text("is_archived = 0"),
+        ),
+    )
 
 
 class Source(UUIDMixin, TimestampMixin, Base):
@@ -285,7 +293,14 @@ class CalendarEvent(UUIDMixin, TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(32), default="pending")
     sync_attempts: Mapped[int] = mapped_column(Integer, default=0)
     next_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    __table_args__ = (UniqueConstraint("connection_id", "external_event_id"),)
+    __table_args__ = (
+        UniqueConstraint("connection_id", "external_event_id"),
+        Index(
+            "ux_calendar_events_task_active", "task_id", unique=True,
+            postgresql_where=text("task_id IS NOT NULL AND status <> 'cancelled'"),
+            sqlite_where=text("task_id IS NOT NULL AND status <> 'cancelled'"),
+        ),
+    )
 
 
 class AIProcessingJob(UUIDMixin, TimestampMixin, Base):

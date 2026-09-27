@@ -58,10 +58,11 @@ def test_openai_provider_validates_response(monkeypatch):
         "status": "completed",
         "output": [{"type": "message", "content": [{"type": "output_text", "text": json.dumps(valid)}]}],
     }
-    result = asyncio.run(OpenAIProvider().interpret("Create task"))
+    result = asyncio.run(OpenAIProvider(timezone="Europe/Moscow").interpret("Create task"))
     assert result.intent == "create_task"
     assert FakeAsyncClient.last_kwargs["json"]["store"] is False
     assert FakeAsyncClient.last_kwargs["headers"]["Authorization"] == "Bearer test-key"
+    assert "Europe/Moscow" in FakeAsyncClient.last_kwargs["json"]["instructions"]
     FakeAsyncClient.result = {"status": "completed", "output": []}
     with pytest.raises(AppError) as exc:
         asyncio.run(OpenAIProvider().interpret("bad"))

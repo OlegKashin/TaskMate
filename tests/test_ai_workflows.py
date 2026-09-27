@@ -97,6 +97,7 @@ def test_ai_classification_creates_inbox_and_notification(db):
     note = db.scalar(select(Notification).where(Notification.user_id == user.id))
     assert item.item_type == "urgent" and item.priority == "high"
     assert note.type == "urgent_item"
+    assert note.payload["title"].startswith("🔴 Срочно\n")
 
 
 def test_bot_section_views(db):
@@ -110,3 +111,56 @@ def test_bot_section_views(db):
     assert "Задачи" in section_message(db, user, "tasks")
     assert "Событий" in section_message(db, user, "schedule")
     assert "не найден" in section_message(db, user, "unknown")
+
+
+def test_ai_search_returns_openable_results(db):
+    user = UserService(db).get_or_create(105)
+    TaskService(db).create(user, {"title": "Подготовить бюджет"})
+    TaskService(db).create(user, {"title": "Позвонить Ивану"})
+    outcome = AIActionService(db).apply(user, result("search_task", {"query": "бюджет"}))
+    assert outcome["state"] == "search_results"
+    assert [task["title"] for task in outcome["tasks"]] == ["Подготовить бюджет"]
+    text, markup = outcome_message(db, user, outcome)
+    assert "Нашёл задач: 1" in text
+    assert markup["inline_keyboard"][0][0]["callback_data"].startswith("a:")
+
+
+def test_ambiguous_task_choice_precedes_confirmation(client, db, monkeypatch):
+    from app.integrations.telegram.client import TelegramClient
+
+    user = UserService(db).get_or_create(106)
+    first, _ = TaskService(db).create(user, {"title": "Отчёт по продажам"})
+    second, _ = TaskService(db).create(user, {"title": "Отчёт по расходам"})
+    requested = result("edit_task", {
+        "target": {"search_hint": {"title_contains": "Отчёт"}},
+        "changed_fields": {"title": "Новый отчёт"},
+    })
+    outcome = AIActionService(db).apply(user, requested)
+    assert outcome["state"] == "clarification" and len(outcome["candidates"]) == 2
+    _, markup = outcome_message(db, user, outcome)
+    edited = []
+    monkeypatch.setattr(TelegramClient, "edit_message", lambda self, *args: edited.append(args))
+    monkeypatch.setattr(TelegramClient, "answer_callback", lambda *args: None)
+    headers = {"X-Telegram-Bot-Api-Secret-Token": "change-me"}
+
+    def click(update_id, token):
+        return client.post("/webhooks/telegram", headers=headers, json={
+            "update_id": update_id, "callback_query": {
+                "id": str(update_id), "from": {"id": 106}, "data": token,
+                "message": {"message_id": 10, "chat": {"id": 106, "type": "private"}},
+            },
+        })
+
+    select_token = markup["inline_keyboard"][0][0]["callback_data"]
+    assert click(10601, select_token).status_code == 200
+    assert first.title == "Отчёт по продажам" and second.title == "Отчёт по расходам"
+    confirm_token = edited[-1][3]["inline_keyboard"][0][0]["callback_data"]
+    assert click(10602, confirm_token).status_code == 200
+    assert first.title == "Новый отчёт" and second.title == "Отчёт по расходам"
+
+
+def test_low_confidence_incomplete_actions_request_clarification(db):
+    user = UserService(db).get_or_create(107)
+    for intent in ("project_action", "source_action", "change_task_status"):
+        uncertain = result(intent, {}, confidence=0.3)
+        assert AIActionService(db).apply(user, uncertain)["state"] == "clarification"

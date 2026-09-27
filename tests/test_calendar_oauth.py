@@ -13,7 +13,7 @@ from app.core.config import Settings, get_settings
 from app.core.errors import AppError
 from app.core.security import SecretBox, issue_user_token
 from app.integrations.calendar import GoogleCalendarAPI
-from app.models.entities import CalendarConnection, CalendarEvent, Notification
+from app.models.entities import CalendarConnection, CalendarEvent, Notification, UIAction
 from app.schemas.domain import AIAction, AIResult
 from app.services.domain import CalendarService, NotificationService, UIActionService, UserService
 from app.services.oauth import OAuthService
@@ -84,6 +84,23 @@ def test_calendar_retry_refresh_and_reconnect(db, monkeypatch):
     with pytest.raises(AppError) as exc:
         GoogleCalendarAPI(db).access_token(connection)
     assert exc.value.code == "CALENDAR_RECONNECT_REQUIRED"
+    get_settings.cache_clear()
+
+
+def test_revoked_calendar_refresh_marks_connection_for_reconnect(db, monkeypatch):
+    user, connection, event = connection_and_event(db)
+    connection.token_expires_at = datetime.now(UTC) - timedelta(minutes=1)
+    db.commit()
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "client")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "secret")
+    get_settings.cache_clear()
+    monkeypatch.setattr(httpx, "post", Mock(return_value=response({
+        "error": "invalid_grant",
+    }, 400)))
+    assert CalendarService(db).sync_pending() == 0
+    assert connection.status == "error"
+    assert event.status == "pending" and event.sync_attempts == 4
+    assert db.query(Notification).filter_by(user_id=user.id, type="calendar_error").count() == 1
     get_settings.cache_clear()
 
 
@@ -175,6 +192,25 @@ def test_calendar_reconnect_error_and_retry_api(db, client, monkeypatch):
     response = client.post(f"/api/v1/calendar/events/{event.id}/retry", headers=headers)
     assert response.status_code == 200
     assert event.sync_attempts == 0
+
+
+def test_calendar_notification_failure_does_not_commit_callback(db):
+    user, _connection, event = connection_and_event(db)
+    db.add(Notification(
+        user_id=user.id, type="calendar_error",
+        payload={"event_id": str(event.id), "title": "Sync failed"},
+    ))
+    db.commit()
+    sender = Mock()
+    sender.send_message.side_effect = RuntimeError("offline")
+    service = NotificationService(db)
+    assert service.deliver_pending(sender) == 0
+    assert db.scalar(select(UIAction).where(UIAction.action == "calendar_retry")) is None
+    sender.send_message.side_effect = None
+    sender.send_message.return_value = {"message_id": 10}
+    assert service.deliver_pending(sender) == 1
+    assert service.deliver_pending(sender) == 0
+    assert db.scalar(select(UIAction).where(UIAction.action == "calendar_retry"))
 
 
 def test_pending_local_calendar_event_can_be_cancelled_offline(db, monkeypatch):

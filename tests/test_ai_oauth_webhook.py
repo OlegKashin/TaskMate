@@ -42,6 +42,24 @@ def test_rule_provider_and_action_service(db):
     assert proposal["state"] == "proposal" and proposal["token"].startswith("a:")
 
 
+def test_local_provider_search_changes_and_relative_date():
+    from zoneinfo import ZoneInfo
+
+    provider = RuleBasedProvider(timezone="Europe/Moscow")
+    search = asyncio.run(provider.interpret("Найди задачу про бюджет"))
+    assert search.intent == "search_task" and search.entities["query"] == "бюджет"
+    edit = asyncio.run(provider.interpret("Перенеси задачу «Отчёт» на завтра"))
+    assert edit.intent == "edit_task" and edit.confidence >= 0.85
+    assert edit.entities["target"]["search_hint"]["title_contains"] == "Отчёт"
+    assert datetime.fromisoformat(edit.entities["changed_fields"]["due_at"]).hour == 18
+    creation = asyncio.run(provider.interpret("Завтра отправить договор"))
+    assert creation.intent == "create_task" and creation.entities["due_at"]
+    local_due = datetime.fromisoformat(creation.entities["due_at"]).astimezone(ZoneInfo("Europe/Moscow"))
+    assert local_due.hour == 18
+    ambiguous = asyncio.run(provider.interpret("Перенеси срок задачи на пятницу"))
+    assert ambiguous.intent == "edit_task" and ambiguous.confidence < 0.60
+
+
 def test_ai_processing_and_failure(db):
     user = UserService(db).get_or_create(2)
     source = Source(
@@ -248,6 +266,40 @@ def test_webhook_rejects_unconnected_group_and_malformed_sender(client):
     assert response.json()["reason"] == "source_not_connected"
     bad = {"update_id": 502, "message": {"message_id": 10, "chat": {"type": "private"}}}
     assert client.post("/webhooks/telegram", headers=headers, json=bad).status_code == 422
+
+
+def test_confirm_ai_rejects_message_owned_by_another_user(client, db, monkeypatch):
+    from app.integrations.telegram.client import TelegramClient
+
+    owner = UserService(db).get_or_create(9912)
+    attacker = UserService(db).get_or_create(9913)
+    source = Source(user_id=owner.id, type="telegram_chat", name="Private", status="active")
+    db.add(source)
+    db.flush()
+    message = Message(
+        user_id=owner.id, source_id=source.id, external_message_id="cross-user",
+        message_type="text", text="Private", received_at=datetime.now(UTC),
+    )
+    db.add(message)
+    db.commit()
+    result = AIResult(
+        intent="create_task", confidence=0.9, entities={"title": "Should not create"},
+        action=AIAction(type="create_task"), reason="test",
+    )
+    token = UIActionService(db).create(attacker, "confirm_ai", {
+        "result": result.model_dump(mode="json"), "message_id": str(message.id),
+    })
+    monkeypatch.setattr(TelegramClient, "answer_callback", lambda *args, **kwargs: None)
+    payload = {"update_id": 9914, "callback_query": {
+        "id": "cross-user", "from": {"id": 9913},
+        "message": {"message_id": 1, "chat": {"id": 9913, "type": "private"}},
+        "data": token,
+    }}
+    response = client.post(
+        "/webhooks/telegram",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "change-me"}, json=payload,
+    )
+    assert response.status_code == 404
 
 
 def test_group_connect_admin_and_member_messages_belong_to_owner(client, db, monkeypatch):

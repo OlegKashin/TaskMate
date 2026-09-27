@@ -56,6 +56,10 @@ def section_view(db, user, section: str) -> tuple[str, dict | None]:
     items = db.scalars(query.limit(10)).all()
     rows = [[_button(db, user, str(getattr(item, "title", None) or getattr(item, "name", None) or item.id)[:40],
                      f"{section}_open", {"id": str(item.id)})] for item in items]
+    if section == "tasks":
+        rows.insert(0, [_button(db, user, "Создать задачу", "task_new_prompt", {})])
+    if section == "projects":
+        rows.insert(0, [_button(db, user, "Создать проект", "project_new_prompt", {})])
     return text, {"inline_keyboard": rows} if rows else None
 
 
@@ -120,14 +124,19 @@ def object_view(db, user, section: str, object_id: uuid.UUID) -> tuple[str, dict
             })])
     elif section == "tasks":
         text = f"✅ {item.title}\nСтатус: {item.status}\nПриоритет: {item.priority}"
-        rows = [[_button(db, user, "Выполнено", "task_complete", {"id": str(item.id)})],
+        rows = [[_button(db, user, "Изменить", "task_edit_prompt", {"id": str(item.id)})],
+                [_button(db, user, "Выполнено…", "task_complete_prompt", {"id": str(item.id)})],
                 [_button(db, user, "Удалить…", "task_delete_prompt", {"id": str(item.id)})]]
     elif section == "projects":
         text = f"📁 {item.name}\n{'Архив' if item.is_archived else 'Активен'}"
-        rows = [[_button(db, user, "Архивировать", "project_archive", {"id": str(item.id)})]]
+        rows = [[_button(db, user, "Переименовать", "project_rename_prompt", {"id": str(item.id)})],
+                [_button(db, user, "Архивировать", "project_archive", {"id": str(item.id)})],
+                [_button(db, user, "Удалить…", "project_delete_prompt", {"id": str(item.id)})]]
     else:
         text = f"🔗 {item.name}\nТип: {item.type}\nСтатус: {item.status}"
-        rows = []
+        rows = [[_button(db, user, "Проекты источника", "source_projects_view", {
+            "id": str(item.id),
+        })]]
         if item.type in {"gmail", "yandex", "mailru", "imap"} and item.status == "active":
             rows.append([_button(db, user, "Выбрать папки", "folder_refresh", {"id": str(item.id)})])
         if item.status in {"active", "paused"}:
@@ -135,6 +144,21 @@ def object_view(db, user, section: str, object_id: uuid.UUID) -> tuple[str, dict
         if item.status != "disconnected":
             rows.append([_button(db, user, "Отключить…", "source_disconnect_prompt", {"id": str(item.id)})])
     return text, {"inline_keyboard": rows} if rows else None
+
+
+def source_projects_view(db, user, source_id: uuid.UUID) -> tuple[str, dict]:
+    from app.services.domain import SourceService
+
+    linked = {project.id for project in SourceService(db).projects(user, source_id)}
+    projects = db.scalars(select(Project).where(
+        Project.user_id == user.id, Project.is_archived.is_(False),
+    ).order_by(Project.name).limit(50)).all()
+    rows = [[_button(db, user, f"{'☑' if project.id in linked else '☐'} {project.name}"[:60],
+                     "source_project_toggle", {"id": str(source_id),
+                                               "project_id": str(project.id)})]
+            for project in projects]
+    rows.append([_button(db, user, "Готово", "sources_open", {"id": str(source_id)})])
+    return "Какие проекты связаны с источником?", {"inline_keyboard": rows}
 
 
 def folders_view(db, user, source_id: uuid.UUID, page: int = 0) -> tuple[str, dict]:

@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from unittest.mock import Mock
 
 from sqlalchemy import select
 
@@ -67,3 +68,46 @@ def test_telegram_photo_respects_source_setting(db, monkeypatch):
     monkeypatch.setattr("app.services.attachments.S3Storage", Storage)
     attachment = save_telegram_attachment(db, message)
     assert attachment.mime_type == "image/jpeg"
+
+
+def test_attachment_download_is_backend_proxied_and_owner_only(
+    client, db, headers, other_headers, monkeypatch
+):
+    user = UserService(db).get_or_create(1001)
+    source = Source(user_id=user.id, type="telegram_chat", name="Chat", status="active")
+    db.add(source)
+    db.flush()
+    message = Message(
+        user_id=user.id, source_id=source.id, external_message_id="file-1",
+        message_type="document", received_at=datetime.now(UTC),
+    )
+    db.add(message)
+    db.flush()
+    attachment = Attachment(
+        message_id=message.id, filename="отчёт.pdf", mime_type="application/pdf",
+        storage_key="users/private/file.pdf", size_bytes=4,
+    )
+    db.add(attachment)
+    db.commit()
+    body = Mock()
+    body.iter_chunks.return_value = iter([b"fi", b"le"])
+    storage = Mock(bucket="taskmate")
+    storage.client.get_object.return_value = {"Body": body}
+    monkeypatch.setattr("app.api.v1.routes.S3Storage", lambda: storage)
+
+    list_url = f"/api/v1/messages/{message.id}/attachments"
+    url = f"/api/v1/attachments/{attachment.id}/download"
+    assert client.get(list_url, headers=other_headers).status_code == 404
+    assert client.get(url, headers=other_headers).status_code == 404
+    assert client.get(url).status_code == 401
+    listed = client.get(list_url, headers=headers)
+    assert listed.status_code == 200
+    assert listed.json()["data"][0]["download_path"] == url
+    downloaded = client.get(url, headers=headers)
+    assert downloaded.status_code == 200 and downloaded.content == b"file"
+    assert downloaded.headers["content-type"] == "application/pdf"
+    assert "users/private" not in str(listed.json())
+    storage.client.get_object.assert_called_once_with(
+        Bucket="taskmate", Key="users/private/file.pdf",
+    )
+    body.close.assert_called_once()

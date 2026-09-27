@@ -18,6 +18,7 @@ from app.models.entities import (
     Source,
     SourceCredential,
     SourceFolder,
+    SourceProject,
     Task,
     TaskEvent,
     UIAction,
@@ -146,10 +147,18 @@ class ProjectService(OwnedService):
         return project
 
     def delete(self, user: User, project_id: uuid.UUID) -> None:
+        project = self.get(user, project_id)
         settings = self.db.get(UserSettings, user.id)
         if settings and settings.default_project_id == project_id:
             settings.default_project_id = None
-        self.db.delete(self.get(user, project_id))
+        self.db.execute(update(Task).where(
+            Task.user_id == user.id, Task.project_id == project_id,
+        ).values(project_id=None))
+        for link in self.db.scalars(select(SourceProject).where(
+            SourceProject.project_id == project_id,
+        )).all():
+            self.db.delete(link)
+        self.db.delete(project)
         self.db.commit()
 
 
@@ -207,6 +216,10 @@ class TaskService(OwnedService):
                 values["project_id"] = settings.default_project_id
         self._project(user, values.get("project_id"))
         if values.get("source_message_id"):
+            if not self.db.scalar(select(Message.id).where(
+                Message.id == values["source_message_id"], Message.user_id == user.id,
+            )):
+                raise not_found("message")
             duplicate = self.db.scalar(
                 select(Task).where(
                     Task.user_id == user.id,
@@ -341,7 +354,10 @@ class UIActionService:
     def __init__(self, db: Session):
         self.db = db
 
-    def create(self, user: User, action: str, payload: dict, ttl_seconds=900) -> str:
+    def create(
+        self, user: User, action: str, payload: dict, ttl_seconds=900,
+        *, commit: bool = True,
+    ) -> str:
         item = UIAction(
             user_id=user.id,
             action=action,
@@ -349,7 +365,10 @@ class UIActionService:
             expires_at=utcnow() + timedelta(seconds=ttl_seconds),
         )
         self.db.add(item)
-        self.db.commit()
+        if commit:
+            self.db.commit()
+        else:
+            self.db.flush()
         return f"a:{base36(item.id)}"
 
     def consume(self, user: User, token: str, expected: str | None = None) -> UIAction:
@@ -383,6 +402,32 @@ class UIActionService:
 
 class SourceService(OwnedService):
     model, label = Source, "source"
+
+    def projects(self, user: User, source_id: uuid.UUID) -> list[Project]:
+        self.get(user, source_id)
+        return self.db.scalars(select(Project).join(SourceProject).where(
+            SourceProject.source_id == source_id,
+            Project.user_id == user.id,
+            Project.is_archived.is_(False),
+        ).order_by(Project.name)).all()
+
+    def replace_projects(
+        self, user: User, source_id: uuid.UUID, project_ids: list[uuid.UUID]
+    ) -> list[Project]:
+        self.get(user, source_id)
+        unique_ids = list(dict.fromkeys(project_ids))
+        projects = [ProjectService(self.db).get(user, project_id) for project_id in unique_ids]
+        if any(project.is_archived for project in projects):
+            raise AppError("PROJECT_ARCHIVED", "Archived project cannot be linked", 422)
+        for link in self.db.scalars(select(SourceProject).where(
+            SourceProject.source_id == source_id
+        )).all():
+            self.db.delete(link)
+        self.db.flush()
+        self.db.add_all(SourceProject(source_id=source_id, project_id=project.id)
+                        for project in projects)
+        self.db.commit()
+        return projects
 
     def create(self, user: User, values: dict[str, Any]) -> Source:
         if values["type"] in {"gmail", "yandex", "mailru"}:
@@ -523,6 +568,13 @@ class SimpleOwnedService(OwnedService):
 class WaitingService(SimpleOwnedService):
     model, label = WaitingFor, "waiting_for"
 
+    def create(self, user: User, values: dict[str, Any]) -> WaitingFor:
+        if values.get("message_id") and not self.db.scalar(select(Message.id).where(
+            Message.id == values["message_id"], Message.user_id == user.id,
+        )):
+            raise not_found("message")
+        return super().create(user, values)
+
     def transition(self, user, object_id, status):
         obj = self.get(user, object_id)
         obj.status = status
@@ -534,6 +586,11 @@ class WaitingService(SimpleOwnedService):
 
 class ReminderService(SimpleOwnedService):
     model, label = Reminder, "reminder"
+
+    def create(self, user: User, values: dict[str, Any]) -> Reminder:
+        if values.get("task_id"):
+            TaskService(self.db).get(user, values["task_id"])
+        return super().create(user, values)
 
     def cancel(self, user, object_id):
         obj = self.get(user, object_id)
@@ -607,15 +664,25 @@ class NotificationService(OwnedService):
 
         client = client or TelegramClient()
         sent = 0
-        notifications = self.db.scalars(
-            select(Notification)
+        notification_ids = self.db.scalars(
+            select(Notification.id)
             .where(Notification.status == "pending")
             .order_by(Notification.created_at)
             .limit(100)
         ).all()
-        for notification in notifications:
+        for notification_id in notification_ids:
+            notification = self.db.scalar(
+                select(Notification)
+                .where(Notification.id == notification_id, Notification.status == "pending")
+                .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
+            )
+            if not notification:
+                self.db.commit()
+                continue
             user = self.db.get(User, notification.user_id)
             if not user or not user.is_active:
+                self.db.commit()
                 continue
             if notification.type == "morning_briefing":
                 body = section_message(self.db, user, "today")
@@ -631,7 +698,9 @@ class NotificationService(OwnedService):
                         label, action, payload = "Повторить", "calendar_retry", {"id": str(event.id)}
                     else:
                         label, action, payload = "Переподключить", "connect_provider", {"provider": "google"}
-                    token = UIActionService(self.db).create(user, action, payload, ttl_seconds=86400)
+                    token = UIActionService(self.db).create(
+                        user, action, payload, ttl_seconds=86400, commit=False,
+                    )
                     markup = {"inline_keyboard": [[
                         {"text": label, "callback_data": token},
                     ]]}
@@ -640,8 +709,10 @@ class NotificationService(OwnedService):
                             if markup else client.send_message(user.telegram_user_id, body))
             except Exception:
                 # Leave it pending for the next scheduler tick.
+                self.db.rollback()
                 continue
             if not response:
+                self.db.rollback()
                 continue
             notification.status = "sent"
             notification.sent_at = utcnow()
@@ -669,6 +740,8 @@ class CalendarService(OwnedService):
             raise not_found("calendar_connection")
         if connection.status != "active":
             raise conflict("CALENDAR_DISCONNECTED", "Calendar connection is not active")
+        if values.get("task_id"):
+            TaskService(self.db).get(user, values["task_id"])
         if values.get("task_id") and self.db.scalar(
             select(CalendarEvent).where(
                 CalendarEvent.task_id == values["task_id"], CalendarEvent.status != "cancelled"

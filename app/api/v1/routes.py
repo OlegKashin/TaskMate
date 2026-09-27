@@ -1,15 +1,23 @@
 import uuid
 from datetime import UTC, datetime, timedelta
+from urllib.parse import quote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import APIRouter, Query
 from fastapi.encoders import jsonable_encoder
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
+from app.core.errors import AppError, not_found
+from app.integrations.storage import S3Storage
 from app.models.entities import (
     AIProcessingJob,
+    Attachment,
     CalendarEvent,
     InboxItem,
+    Message,
     Task,
 )
 from app.schemas.domain import (
@@ -27,6 +35,7 @@ from app.schemas.domain import (
     ReminderPatch,
     SourceCreate,
     SourcePatch,
+    SourceProjectsPatch,
     TaskCreate,
     TaskPatch,
     UserPatch,
@@ -178,6 +187,18 @@ def disconnect_source(object_id: uuid.UUID, db: DB, user: CurrentUser):
     return ok(SourceService(db).disconnect(user, object_id))
 
 
+@router.get("/sources/{object_id}/projects")
+def source_projects(object_id: uuid.UUID, db: DB, user: CurrentUser):
+    return ok(SourceService(db).projects(user, object_id))
+
+
+@router.put("/sources/{object_id}/projects")
+def replace_source_projects(
+    object_id: uuid.UUID, payload: SourceProjectsPatch, db: DB, user: CurrentUser
+):
+    return ok(SourceService(db).replace_projects(user, object_id, payload.project_ids))
+
+
 @router.get("/sources/{object_id}/folders")
 def folders(object_id: uuid.UUID, db: DB, user: CurrentUser):
     return ok(SourceService(db).folders(user, object_id))
@@ -198,6 +219,52 @@ def discover_folders(object_id: uuid.UUID, db: DB, user: CurrentUser):
 @router.post("/sources/{object_id}/imap-credentials")
 def configure_imap(object_id: uuid.UUID, payload: IMAPCredentials, db: DB, user: CurrentUser):
     return ok(EmailService(db).configure_imap(user, object_id, payload.username, payload.password))
+
+
+@router.get("/messages/{message_id}/attachments")
+def message_attachments(message_id: uuid.UUID, db: DB, user: CurrentUser):
+    if not db.scalar(select(Message.id).where(
+        Message.id == message_id, Message.user_id == user.id,
+    )):
+        raise not_found("message")
+    attachments = db.scalars(select(Attachment).where(
+        Attachment.message_id == message_id,
+    ).order_by(Attachment.created_at)).all()
+    return ok([{
+        "id": str(item.id), "filename": item.filename,
+        "mime_type": item.mime_type, "size_bytes": item.size_bytes,
+        "download_path": f"/api/v1/attachments/{item.id}/download",
+    } for item in attachments])
+
+
+@router.get("/attachments/{attachment_id}/download")
+def download_attachment(attachment_id: uuid.UUID, db: DB, user: CurrentUser):
+    attachment = db.scalar(select(Attachment).join(Message).where(
+        Attachment.id == attachment_id, Message.user_id == user.id,
+    ))
+    if not attachment:
+        raise not_found("attachment")
+    try:
+        storage = S3Storage()
+        body = storage.client.get_object(
+            Bucket=storage.bucket, Key=attachment.storage_key,
+        )["Body"]
+    except (BotoCoreError, ClientError) as exc:
+        raise AppError("ATTACHMENT_UNAVAILABLE", "Attachment is unavailable", 502) from exc
+
+    def chunks():
+        try:
+            yield from body.iter_chunks(chunk_size=64 * 1024)
+        finally:
+            body.close()
+
+    mime_type = attachment.mime_type or "application/octet-stream"
+    if any(char in mime_type for char in "\r\n"):
+        mime_type = "application/octet-stream"
+    return StreamingResponse(chunks(), media_type=mime_type, headers={
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(attachment.filename, safe='')}",
+        "Cache-Control": "private, no-store",
+    })
 
 
 @router.get("/inbox")
@@ -387,21 +454,18 @@ def analyze_status(job_id: uuid.UUID, db: DB, user: CurrentUser):
         )
     )
     if not job:
-        from app.core.errors import not_found
-
         raise not_found("ai_job")
     return ok(job)
 
 
 @router.get("/today")
 def today(db: DB, user: CurrentUser):
-    now = datetime.now(UTC)
-    end = now + timedelta(days=1)
+    start, end = _user_day_bounds(user.timezone)
     tasks = db.scalars(
         select(Task).where(
             Task.user_id == user.id,
             Task.deleted_at.is_(None),
-            Task.due_at >= now,
+            Task.due_at >= start,
             Task.due_at < end,
         )
     ).all()
@@ -409,7 +473,7 @@ def today(db: DB, user: CurrentUser):
         select(CalendarEvent).where(
             CalendarEvent.user_id == user.id,
             CalendarEvent.status != "cancelled",
-            CalendarEvent.start_at >= now,
+            CalendarEvent.start_at >= start,
             CalendarEvent.start_at < end,
         )
     ).all()
@@ -418,11 +482,16 @@ def today(db: DB, user: CurrentUser):
 
 @router.get("/stats")
 def stats(db: DB, user: CurrentUser):
+    start, end = _user_day_bounds(user.timezone)
     created = (
         db.scalar(
             select(func.count())
             .select_from(Task)
-            .where(Task.user_id == user.id, Task.deleted_at.is_(None))
+            .where(
+                Task.user_id == user.id,
+                Task.created_at >= start,
+                Task.created_at < end,
+            )
         )
         or 0
     )
@@ -430,8 +499,21 @@ def stats(db: DB, user: CurrentUser):
         db.scalar(
             select(func.count())
             .select_from(Task)
-            .where(Task.user_id == user.id, Task.status == "completed", Task.deleted_at.is_(None))
+            .where(
+                Task.user_id == user.id,
+                Task.completed_at >= start,
+                Task.completed_at < end,
+            )
         )
         or 0
     )
     return ok({"tasks": created, "completed": completed})
+
+
+def _user_day_bounds(timezone: str) -> tuple[datetime, datetime]:
+    try:
+        zone = ZoneInfo(timezone)
+    except ZoneInfoNotFoundError:
+        zone = ZoneInfo("UTC")
+    start = datetime.now(zone).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start.astimezone(UTC), (start + timedelta(days=1)).astimezone(UTC)

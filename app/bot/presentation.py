@@ -27,6 +27,30 @@ def outcome_message(db: Session, user: User, outcome: dict) -> tuple[str, dict |
             {"text": "Подключить", "callback_data": connect},
             {"text": "Отмена", "callback_data": cancel},
         ]]}
+    if state == "project_choice":
+        candidates = outcome.get("candidates", [])
+        rows = [[{
+            "text": project["name"][:40],
+            "callback_data": UIActionService(db).create(user, "select_project", {
+                "project_id": project["id"], "result": outcome["result"],
+                "message_id": outcome["message_id"],
+            }),
+        }] for project in candidates]
+        if not outcome.get("all_projects"):
+            rows.append([{
+                "text": "Другой",
+                "callback_data": UIActionService(db).create(user, "project_choice_other", {
+                    "result": outcome["result"], "message_id": outcome["message_id"],
+                }),
+            }])
+        rows.append([{
+            "text": "Inbox",
+            "callback_data": UIActionService(db).create(user, "select_project", {
+                "project_id": None, "result": outcome["result"],
+                "message_id": outcome["message_id"],
+            }),
+        }])
+        return "К какому проекту отнести задачу?", {"inline_keyboard": rows}
     if state == "proposal":
         entities = outcome.get("entities", {})
         title = entities.get("title") or entities.get("target") or outcome["intent"]
@@ -58,9 +82,28 @@ def outcome_message(db: Session, user: User, outcome: dict) -> tuple[str, dict |
                 {"text": "Отменить", "callback_data": outcome["undo"]}
             ]]}
         return text, None
+    if state == "search_results":
+        tasks = outcome.get("tasks", [])
+        if not tasks:
+            return f"Не нашёл задач по запросу «{outcome.get('query', '')}».", None
+        rows = [[{
+            "text": task["title"][:40],
+            "callback_data": UIActionService(db).create(user, "tasks_open", {"id": task["id"]}),
+        }] for task in tasks]
+        return f"🔎 Нашёл задач: {len(tasks)}", {"inline_keyboard": rows}
     if state == "clarification":
         lines = [outcome.get("reason") or "Уточните запрос, пожалуйста."]
-        lines.extend(item["title"] for item in outcome.get("candidates", []))
+        candidates = outcome.get("candidates", [])
+        lines.extend(f"{index}. {item['title']}" for index, item in enumerate(candidates, 1))
+        if candidates and outcome.get("result"):
+            rows = [[{
+                "text": item["title"][:40],
+                "callback_data": UIActionService(db).create(user, "select_task", {
+                    "task_id": item["id"], "result": outcome["result"],
+                    "message_id": outcome.get("message_id"),
+                }),
+            }] for item in candidates]
+            return "\n".join(lines), {"inline_keyboard": rows}
         return "\n".join(lines), None
     return outcome.get("reason") or "Запрос обработан.", None
 

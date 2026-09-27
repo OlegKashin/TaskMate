@@ -1,5 +1,5 @@
 import uuid
-from datetime import time
+from datetime import UTC, datetime, time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Header
@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from app.ai.service import AIActionService
 from app.api.deps import DB
 from app.bot.actions import ACTIONS, handle_action
+from app.bot.manual import new_task_draft, set_task_due
 from app.bot.presentation import outcome_message, section_message
 from app.bot.views import section_view
 from app.core.config import get_settings
@@ -19,6 +20,7 @@ from app.models.entities import (
     AIProcessingJob,
     InboxItem,
     Message,
+    Project,
     Source,
     TelegramUpdate,
     User,
@@ -26,7 +28,14 @@ from app.models.entities import (
 )
 from app.schemas.domain import AIResult
 from app.services.analysis import queue_source_analysis
-from app.services.domain import SourceService, TaskService, UIActionService, UserService, utcnow
+from app.services.domain import (
+    ProjectService,
+    SourceService,
+    TaskService,
+    UIActionService,
+    UserService,
+    utcnow,
+)
 from app.services.email import EmailService
 from app.services.oauth import OAuthService
 
@@ -120,7 +129,10 @@ def telegram_webhook(
         chat_id = callback_message.get("chat", {}).get("id", tg_id)
         message_id = callback_message.get("message_id")
         if callback_message.get("chat", {}).get("type") != "private" and (
-            action.action in ACTIONS or action.action in {"navigate", "send_email", "retry_email", "edit_email"}
+            action.action in ACTIONS or action.action in {
+                "navigate", "select_task", "select_project", "project_choice_other",
+                "send_email", "retry_email", "edit_email",
+            }
         ):
             client.answer_callback(callback.get("id"), "Откройте этот раздел в личном чате с ботом")
             db.commit()
@@ -161,12 +173,73 @@ def telegram_webhook(
             client.answer_callback(callback.get("id"))
             db.commit()
             return {"ok": True, "action": action.action}
+        if action.action == "project_choice_other":
+            projects = db.scalars(select(Project).where(
+                Project.user_id == user.id, Project.is_archived.is_(False),
+            ).order_by(Project.name).limit(50)).all()
+            outcome = {
+                "state": "project_choice", "all_projects": True,
+                "candidates": [{"id": str(project.id), "name": project.name}
+                               for project in projects],
+                "result": action.payload["result"],
+                "message_id": action.payload["message_id"],
+            }
+            text, markup = outcome_message(db, user, outcome)
+            if message_id:
+                client.edit_message(chat_id, message_id, text, markup)
+            else:
+                client.send_message(chat_id, text, markup)
+            client.answer_callback(callback.get("id"))
+            db.commit()
+            return {"ok": True, "action": "project_choice_other"}
+        if action.action == "select_project":
+            project_id = action.payload.get("project_id")
+            if project_id:
+                project = ProjectService(db).get(user, uuid.UUID(project_id))
+                if project.is_archived:
+                    raise AppError("PROJECT_ARCHIVED", "Project is archived", 422)
+            message = db.get(Message, uuid.UUID(action.payload["message_id"]))
+            if not message or message.user_id != user.id:
+                raise AppError("MESSAGE_NOT_FOUND", "Message not found", 404)
+            result = AIResult.model_validate(action.payload["result"])
+            result = result.model_copy(update={
+                "entities": {**result.entities, "project_id": project_id},
+            })
+            outcome = AIActionService(db).apply(user, result, message)
+            text, markup = outcome_message(db, user, outcome)
+            if message_id:
+                client.edit_message(chat_id, message_id, text, markup)
+            else:
+                client.send_message(chat_id, text, markup)
+            client.answer_callback(callback.get("id"))
+            db.commit()
+            return {"ok": True, "action": "select_project"}
+        if action.action == "select_task":
+            selected = TaskService(db).get(user, uuid.UUID(action.payload["task_id"]))
+            result = AIResult.model_validate(action.payload["result"])
+            result = result.model_copy(update={
+                "entities": {**result.entities, "target": {"task_id": str(selected.id)}},
+            })
+            message = db.get(Message, uuid.UUID(action.payload["message_id"])) if action.payload.get("message_id") else None
+            if message and message.user_id != user.id:
+                raise AppError("MESSAGE_NOT_FOUND", "Message not found", 404)
+            outcome = AIActionService(db).apply(user, result, message)
+            text, markup = outcome_message(db, user, outcome)
+            if message_id:
+                client.edit_message(chat_id, message_id, text, markup)
+            else:
+                client.send_message(chat_id, text, markup)
+            client.answer_callback(callback.get("id"))
+            db.commit()
+            return {"ok": True, "action": "select_task"}
         if action.action == "confirm_ai":
             message = (
                 db.get(Message, uuid.UUID(action.payload["message_id"]))
                 if action.payload.get("message_id")
                 else None
             )
+            if message and message.user_id != user.id:
+                raise AppError("MESSAGE_NOT_FOUND", "Message not found", 404)
             outcome = AIActionService(db).execute(
                 user, AIResult.model_validate(action.payload["result"]), message
             )
@@ -349,6 +422,68 @@ def telegram_webhook(
             TelegramClient().send_message(chat_id, f"Не удалось начать подключение: {exc.message}")
         db.commit()
         return {"ok": True, "command": "connect_mailru"}
+    if command == "/task" and chat.get("type") == "private":
+        parts = (message_data.get("text") or "").split(maxsplit=1)
+        if len(parts) != 2 or not parts[1].strip():
+            TelegramClient().send_message(chat_id, "Укажите название задачи: /task <название>")
+        else:
+            text, markup = new_task_draft(db, user, parts[1])
+            TelegramClient().send_message(chat_id, text, markup)
+        db.commit()
+        return {"ok": True, "command": "task"}
+    if command == "/task_due" and chat.get("type") == "private":
+        parts = (message_data.get("text") or "").split(maxsplit=3)
+        if len(parts) != 4:
+            TelegramClient().send_message(chat_id, "Формат: /task_due <token> ГГГГ-ММ-ДД ЧЧ:ММ")
+        else:
+            text, markup = set_task_due(db, user, parts[1], f"{parts[2]} {parts[3]}")
+            TelegramClient().send_message(chat_id, text, markup)
+        db.commit()
+        return {"ok": True, "command": "task_due"}
+    if command == "/project" and chat.get("type") == "private":
+        parts = (message_data.get("text") or "").split(maxsplit=1)
+        if len(parts) != 2 or not parts[1].strip():
+            TelegramClient().send_message(chat_id, "Укажите название проекта: /project <название>")
+        else:
+            name = parts[1].strip()
+            if len(name) > 255:
+                raise AppError("VALIDATION_ERROR", "Название проекта слишком длинное", 422)
+            create = UIActionService(db).create(user, "project_create_confirm", {"name": name})
+            cancel = UIActionService(db).create(user, "cancel_ai", {})
+            TelegramClient().send_message(chat_id, f"Создать проект «{name}»?", {
+                "inline_keyboard": [[
+                    {"text": "Создать", "callback_data": create},
+                    {"text": "Отмена", "callback_data": cancel},
+                ]],
+            })
+        db.commit()
+        return {"ok": True, "command": "project"}
+    if command in {"/task_edit", "/project_rename"} and chat.get("type") == "private":
+        parts = (message_data.get("text") or "").split(maxsplit=2)
+        if len(parts) != 3 or not parts[2].strip():
+            TelegramClient().send_message(chat_id, f"Формат: {command} <id> <новое название>")
+            db.commit()
+            return {"ok": True, "command": command.removeprefix("/")}
+        try:
+            object_id = uuid.UUID(parts[1])
+        except ValueError as exc:
+            raise AppError("VALIDATION_ERROR", "Invalid object ID", 422) from exc
+        title = parts[2].strip()
+        if command == "/task_edit":
+            if len(title) > 500:
+                raise AppError("VALIDATION_ERROR", "Название задачи слишком длинное", 422)
+            task, undo = TaskService(db).patch(user, object_id, {"title": title})
+            text, markup = outcome_message(db, user, {
+                "state": "executed", "object_id": str(task.id), "undo": undo,
+            })
+        else:
+            if len(title) > 255:
+                raise AppError("VALIDATION_ERROR", "Название проекта слишком длинное", 422)
+            project = ProjectService(db).patch(user, object_id, {"name": title})
+            text, markup = f"Проект переименован: {project.name}", None
+        TelegramClient().send_message(chat_id, text, markup)
+        db.commit()
+        return {"ok": True, "command": command.removeprefix("/")}
     if command == "/reply" and chat.get("type") == "private":
         args = (message_data.get("text") or "").split(maxsplit=2)
         if len(args) < 3:
@@ -541,6 +676,7 @@ def telegram_webhook(
     if chat_type == "private":
         source_query = source_query.where(Source.user_id == user.id)
     source = db.scalar(source_query.order_by(Source.connected_at.desc()))
+    created_source = source is None
     if not source:
         if chat_type != "private":
             db.commit()
@@ -558,15 +694,20 @@ def telegram_webhook(
         return {"ok": True, "ignored": True, "reason": "source_inactive"}
     if chat_type != "private":
         user = db.get(User, source.user_id)
+    message_date = message_data.get("date")
+    received_at = (
+        datetime.fromtimestamp(message_date, UTC)
+        if isinstance(message_date, int)
+        else utcnow()
+    )
+    connected_at = source.connected_at
+    if connected_at and not created_source:
+        connected_at = connected_at.replace(tzinfo=connected_at.tzinfo or UTC)
+        if received_at <= connected_at:
+            db.commit()
+            return {"ok": True, "ignored": True, "reason": "before_source_connected"}
     is_voice = "voice" in message_data
     has_attachment = any(key in message_data for key in ("voice", "photo", "document"))
-    if (is_voice and not source.analysis_voice and not source.save_attachments) or (
-        not is_voice
-        and not source.analysis_text
-        and not (has_attachment and source.save_attachments)
-    ):
-        db.commit()
-        return {"ok": True, "ignored": True, "reason": "source_analysis_disabled"}
     external_message_id = str(message_data.get("message_id"))
     if db.scalar(
         select(Message).where(
@@ -591,7 +732,7 @@ def telegram_webhook(
         sender_name=sender.get("first_name"),
         text=text,
         message_type=message_type,
-        received_at=utcnow(),
+        received_at=received_at,
         raw_payload=payload,
         processing_status="queued" if needs_job else "ignored",
     )
@@ -599,7 +740,13 @@ def telegram_webhook(
     db.flush()
     if not needs_job:
         db.commit()
-        return {"ok": True, "ignored": True, "reason": "no_analyzable_content"}
+        return {
+            "ok": True,
+            "ignored": True,
+            "reason": "source_analysis_disabled"
+            if not source.analysis_text and not source.analysis_voice and not source.save_attachments
+            else "no_analyzable_content",
+        }
     job = AIProcessingJob(
         user_id=user.id,
         message_id=message.id,

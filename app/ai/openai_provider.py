@@ -1,6 +1,8 @@
 """Optional hosted LLM adapter; domain validation remains authoritative."""
 
 import json
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
@@ -23,13 +25,24 @@ Contract JSON Schema: """ + json.dumps(AIResult.model_json_schema(), ensure_asci
 
 
 class OpenAIProvider:
+    def __init__(self, timezone: str = "UTC"):
+        self.timezone = timezone
+
     async def interpret(self, text: str) -> AIResult:
         settings = get_settings()
         if not settings.llm_api_key or settings.llm_model == "local-rules":
             raise AppError("LLM_NOT_CONFIGURED", "Configure LLM_API_KEY and LLM_MODEL", 503)
+        try:
+            zone = ZoneInfo(self.timezone)
+        except ZoneInfoNotFoundError:
+            zone = UTC
         request = {
             "model": settings.llm_model,
-            "instructions": INSTRUCTIONS,
+            "instructions": (
+                INSTRUCTIONS + "\nCurrent user timezone: " + self.timezone
+                + "\nCurrent local date and time: " + datetime.now(zone).isoformat()
+                + "\nInterpret relative dates using this local time."
+            ),
             "input": text[:12000],
             "text": {"format": {"type": "json_object"}},
             "store": False,

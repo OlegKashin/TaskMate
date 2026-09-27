@@ -60,6 +60,10 @@ class SourcePatch(BaseModel):
     save_attachments: bool | None = None
 
 
+class SourceProjectsPatch(BaseModel):
+    project_ids: list[uuid.UUID]
+
+
 class FolderSelection(BaseModel):
     external_folder_id: str
     is_selected: bool
@@ -193,15 +197,15 @@ class AIResult(BaseModel):
             raise ValueError(f"Missing entities for {self.intent}: {', '.join(missing)}")
         if self.action.type not in {self.intent, "none"}:
             raise ValueError("action.type does not match intent")
-        if self.intent == "change_task_status" and self.entities.get("new_status") not in {
+        if self.intent == "change_task_status" and self.entities.get("new_status") is not None and self.entities["new_status"] not in {
             "new", "in_progress", "completed", "cancelled"
         }:
             raise ValueError("Invalid task status")
-        if self.intent == "project_action" and self.entities["action"] not in {
+        if self.intent == "project_action" and self.entities.get("action") is not None and self.entities["action"] not in {
             "create", "rename", "archive", "delete"
         }:
             raise ValueError("Invalid project action")
-        if self.intent == "source_action" and self.entities["action"] not in {
+        if self.intent == "source_action" and self.entities.get("action") is not None and self.entities["action"] not in {
             "pause", "resume", "disconnect", "change_settings"
         }:
             raise ValueError("Invalid source action")
