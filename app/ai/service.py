@@ -19,7 +19,6 @@ from app.models.entities import (
     Source,
     Task,
     User,
-    UserSettings,
 )
 from app.schemas.domain import AIAction, AIResult
 from app.services.domain import (

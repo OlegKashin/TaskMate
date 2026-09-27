@@ -45,8 +45,6 @@ ACTIONS = {
     "project_delete_prompt", "project_delete",
     "task_snooze", "task_add_calendar", "source_setting_toggle",
     "waiting_open", "waiting_complete", "waiting_cancel", "reminder_cancel",
-    "cancel_ai", "edit_ai", "source_connect_menu", "setting_timezone",
-    "task_disambiguate_edit", "project_disambiguate_rename",
 }
 
 
@@ -303,20 +301,4 @@ def handle_action(db, user, action) -> tuple[str, dict | None]:
     if kind == "reminder_cancel":
         ReminderService(db).cancel(user, uuid.UUID(payload["id"]))
         return "Напоминание отменено.", None
-    if kind == "cancel_ai":
-        return "Действие отменено.", None
-    if kind == "edit_ai":
-        return "Отправьте уточнённое сообщение с изменениями.", None
-    if kind == "setting_timezone":
-        return ("Укажите часовой пояс: /timezone Europe/Moscow\n"
-                "Или укажите ваш город/регион, например /timezone Asia/Yekaterinburg"), None
-    if kind == "source_connect_menu":
-        from app.bot.telegram import email_connect_menu
-        return "Подключить почту или календарь:", email_connect_menu(db, user)
-    if kind == "task_disambiguate_edit":
-        task, undo = TaskService(db).patch(user, uuid.UUID(payload["id"]), {"title": payload["title"]})
-        return outcome_message(db, user, {"state": "executed", "object_id": str(task.id), "undo": undo})
-    if kind == "project_disambiguate_rename":
-        project = ProjectService(db).patch(user, uuid.UUID(payload["id"]), {"name": payload["name"]})
-        return f"Проект переименован: {project.name}", None
     return "Действие недоступно.", None

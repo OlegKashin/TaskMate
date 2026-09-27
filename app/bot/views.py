@@ -29,7 +29,6 @@ def section_view(db, user, section: str) -> tuple[str, dict | None]:
     if section == "settings":
         settings = db.get(UserSettings, user.id)
         rows = [
-            [_button(db, user, "Изменить часовой пояс", "setting_timezone", {})],
             [_button(db, user, "Утренняя сводка вкл/выкл", "setting_toggle", {"field": "morning_briefing_enabled"})],
             [_button(db, user, "Вечерняя статистика вкл/выкл", "setting_toggle", {"field": "evening_stats_enabled"})],
             [_button(db, user, "Время сводок", "setting_times", {})],
@@ -64,8 +63,6 @@ def section_view(db, user, section: str) -> tuple[str, dict | None]:
         rows.insert(0, [_button(db, user, "Создать задачу", "task_new_prompt", {})])
     if section == "projects":
         rows.insert(0, [_button(db, user, "Создать проект", "project_new_prompt", {})])
-    if section == "sources":
-        rows.insert(0, [_button(db, user, "Подключить источник", "source_connect_menu", {})])
     return text, {"inline_keyboard": rows} if rows else None
 
 

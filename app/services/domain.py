@@ -219,7 +219,7 @@ class TaskService(OwnedService):
 
     def create(self, user: User, values: dict[str, Any], source="user_command") -> tuple[Task, str]:
         values = dict(values)
-        if not values.get("project_id"):
+        if "project_id" not in values:
             settings = self.db.get(UserSettings, user.id)
             if settings and settings.default_project_id:
                 values["project_id"] = settings.default_project_id
