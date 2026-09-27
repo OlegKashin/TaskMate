@@ -1,5 +1,7 @@
+import asyncio
 import logging
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -8,11 +10,32 @@ from fastapi.responses import JSONResponse
 from app.api.oauth_routes import router as oauth_router
 from app.api.v1.routes import router as api_router
 from app.bot.telegram import router as telegram_router
+from app.core.config import get_settings
 from app.core.errors import AppError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
-app = FastAPI(title="TaskMate AI", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = get_settings()
+    stop_event = asyncio.Event()
+    polling_task = None
+    if settings.telegram_mode.lower() == "polling" and settings.telegram_bot_token:
+        from app.bot.polling import start_polling_background
+        polling_task = asyncio.create_task(start_polling_background(stop_event))
+    try:
+        yield
+    finally:
+        stop_event.set()
+        if polling_task:
+            try:
+                await asyncio.wait_for(polling_task, timeout=2.0)
+            except (TimeoutError, asyncio.CancelledError, Exception):
+                pass
+
+
+app = FastAPI(title="TaskMate AI", version="0.1.0", lifespan=lifespan)
 app.include_router(api_router)
 app.include_router(oauth_router)
 app.include_router(telegram_router)

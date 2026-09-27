@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, Header
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from app.ai.service import AIActionService
 from app.api.deps import DB
@@ -137,6 +138,10 @@ def telegram_webhook(
 ):
     if secret != get_settings().telegram_webhook_secret:
         raise AppError("AUTH_ERROR", "Invalid Telegram webhook secret", 401)
+    return process_telegram_update(db, payload)
+
+
+def process_telegram_update(db: Session, payload: dict) -> dict:
     update_id = payload.get("update_id")
     if not isinstance(update_id, int):
         raise AppError("VALIDATION_ERROR", "update_id is required", 422)

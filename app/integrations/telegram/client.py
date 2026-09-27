@@ -56,6 +56,33 @@ class TelegramClient:
             raise AppError("TELEGRAM_FILE_ERROR", "Telegram file download failed", 502) from exc
         return bytes(chunks)
 
+    def get_updates(
+        self, offset: int | None = None, timeout: int = 30, limit: int = 100
+    ) -> list[dict]:
+        payload: dict = {
+            "timeout": timeout,
+            "limit": limit,
+            "allowed_updates": ["message", "edited_message", "callback_query"],
+        }
+        if offset is not None:
+            payload["offset"] = offset
+        res = self._call("getUpdates", payload)
+        return res if isinstance(res, list) else []
+
+    def delete_webhook(self, drop_pending_updates: bool = False) -> bool:
+        res = self._call("deleteWebhook", {"drop_pending_updates": drop_pending_updates})
+        return bool(res)
+
+    def set_webhook(self, url: str, secret_token: str | None = None) -> bool:
+        payload: dict = {
+            "url": url,
+            "allowed_updates": ["message", "edited_message", "callback_query"],
+        }
+        if secret_token:
+            payload["secret_token"] = secret_token
+        res = self._call("setWebhook", payload)
+        return bool(res)
+
 
 def main_menu(tokens: dict[str, str]):
     return {

@@ -19,6 +19,7 @@ from app.models.entities import (
     AIProcessingJob,
     InboxItem,
     Message,
+    Project,
     Source,
     SourceCredential,
     SourceFolder,
@@ -530,6 +531,7 @@ def test_task_events_service_and_api(db, client):
 
 def test_wake_due_snoozed_and_inbox_filtering(db):
     from datetime import timedelta
+
     from app.bot.presentation import section_message
     from app.services.domain import InboxService, utcnow
 
@@ -577,8 +579,14 @@ def test_task_duplicate_allowed_after_completed_or_cancelled(db):
     assert task2.title == "Recreated Task"
 
 
-def test_bot_slash_commands_and_short_token_resolution(db, client):
+def test_bot_slash_commands_and_short_token_resolution(db, client, monkeypatch):
     from app.core.config import get_settings
+    from app.integrations.telegram.client import TelegramClient
+
+    sent = Mock(return_value={"message_id": 991})
+    delayed = Mock()
+    monkeypatch.setattr(TelegramClient, "send_message", sent)
+    monkeypatch.setattr(tasks.process_message, "delay", delayed)
 
     user = UserService(db).get_or_create(5020)
     task, _ = TaskService(db).create(user, {"title": "Old Task Name"})
@@ -633,6 +641,7 @@ def test_bot_slash_commands_and_short_token_resolution(db, client):
 
 def test_bot_actions_snooze_calendar_source_waiting_reminder(db):
     from datetime import timedelta
+
     from app.models.entities import CalendarConnection, CalendarEvent
     from app.services.domain import ReminderService, WaitingService, utcnow
 
@@ -711,6 +720,7 @@ def test_notification_deliver_pending_markups(db):
 
 def test_voice_message_processing_echo_and_calendar_suggest(db, monkeypatch):
     from contextlib import nullcontext
+
     from app.models.entities import CalendarConnection
 
     user = UserService(db).get_or_create(5023)
@@ -830,14 +840,15 @@ def test_analyze_without_sources_provides_connect_button(db, client):
 def test_disambiguation_on_ambiguous_prefix_edit_and_rename(db, client):
     from app.core.config import get_settings
     user = UserService(db).get_or_create(5032)
-    # Create two tasks
-    task_a, _ = TaskService(db).create(user, {"title": "Task Alpha"})
-    task_b, _ = TaskService(db).create(user, {"title": "Task Beta"})
-    # Find common prefix or force IDs to have common prefix for testing
-    task_b.id = uuid.UUID(f"{str(task_a.id)[:8]}-0000-0000-0000-000000000002")
+    id_a = uuid.UUID("aaaaaaaa-0000-0000-0000-000000000001")
+    id_b = uuid.UUID("aaaaaaaa-0000-0000-0000-000000000002")
+    task_a = Task(id=id_a, user_id=user.id, title="Task Alpha")
+    task_b = Task(id=id_b, user_id=user.id, title="Task Beta")
+    db.add(task_a)
+    db.add(task_b)
     db.commit()
 
-    prefix = str(task_a.id)[:8]
+    prefix = "aaaaaaaa"
     secret = get_settings().telegram_webhook_secret
     headers = {"X-Telegram-Bot-Api-Secret-Token": secret}
 
@@ -863,11 +874,14 @@ def test_disambiguation_on_ambiguous_prefix_edit_and_rename(db, client):
     assert task_a.title == "Renamed Alpha Solo"
 
     # Test project disambiguation
-    proj_a = ProjectService(db).create(user, {"name": "Project Alpha"})
-    proj_b = ProjectService(db).create(user, {"name": "Project Beta"})
-    proj_b.id = uuid.UUID(f"{str(proj_a.id)[:8]}-0000-0000-0000-000000000002")
+    pid_a = uuid.UUID("bbbbbbbb-0000-0000-0000-000000000001")
+    pid_b = uuid.UUID("bbbbbbbb-0000-0000-0000-000000000002")
+    proj_a = Project(id=pid_a, user_id=user.id, name="Project Alpha")
+    proj_b = Project(id=pid_b, user_id=user.id, name="Project Beta")
+    db.add(proj_a)
+    db.add(proj_b)
     db.commit()
-    p_prefix = str(proj_a.id)[:8]
+    p_prefix = "bbbbbbbb"
 
     res_p = client.post("/webhooks/telegram", headers=headers, json={
         "update_id": 7003,
@@ -892,3 +906,79 @@ def test_disambiguation_on_ambiguous_prefix_edit_and_rename(db, client):
     # Cancel AI action
     t_c, _ = handle_action(db, user, SimpleNamespace(action="cancel_ai", payload={}))
     assert "отменено" in t_c
+
+
+def test_telegram_mode_config_and_validation():
+    from app.core.config import Settings
+    s_default = Settings()
+    assert s_default.telegram_mode == "polling"
+
+    # In production with polling mode, TELEGRAM_WEBHOOK_SECRET is not required
+    s_prod_polling = Settings(
+        app_env="production",
+        internal_api_token="valid-token-123",
+        encryption_key="valid-key-123",
+        telegram_bot_token="bot123:token",
+        telegram_mode="polling",
+        telegram_webhook_secret="change-me",
+    )
+    assert s_prod_polling.telegram_mode == "polling"
+
+    # In production with webhook mode, TELEGRAM_WEBHOOK_SECRET is required
+    with pytest.raises(ValueError) as exc:
+        Settings(
+            app_env="production",
+            internal_api_token="valid-token-123",
+            encryption_key="valid-key-123",
+            telegram_bot_token="bot123:token",
+            telegram_mode="webhook",
+            telegram_webhook_secret="change-me",
+        )
+    assert "TELEGRAM_WEBHOOK_SECRET" in str(exc.value)
+
+
+def test_telegram_client_webhook_and_polling_methods(monkeypatch):
+    from app.integrations.telegram.client import TelegramClient
+    tc = TelegramClient(token="mock-token")
+    mock_post = Mock()
+    mock_post.return_value.json.return_value = {"ok": True, "result": [{"update_id": 100, "message": {"text": "hi"}}]}
+    mock_post.return_value.raise_for_status = Mock()
+    monkeypatch.setattr("app.integrations.telegram.client.httpx.post", mock_post)
+
+    # get_updates
+    updates = tc.get_updates(offset=99, timeout=10)
+    assert len(updates) == 1 and updates[0]["update_id"] == 100
+
+    # delete_webhook
+    mock_post.return_value.json.return_value = {"ok": True, "result": True}
+    assert tc.delete_webhook() is True
+
+    # set_webhook
+    assert tc.set_webhook("https://example.com/wh", secret_token="sec123") is True
+
+
+def test_polling_runner_and_poll_once(db, monkeypatch):
+    import threading
+
+    from app.bot.polling import poll_once, run_polling
+    from app.integrations.telegram.client import TelegramClient
+
+    monkeypatch.setattr(TelegramClient, "send_message", Mock(return_value={"message_id": 991}))
+    monkeypatch.setattr(TelegramClient, "delete_webhook", Mock(return_value=True))
+    monkeypatch.setattr(tasks.process_message, "delay", Mock())
+
+    client = Mock()
+    client.token = "test-token"
+    client.get_updates.return_value = [
+        {"update_id": 8001, "message": {"message_id": 1, "chat": {"id": 8001, "type": "private"}, "from": {"id": 8001}, "text": "/today"}}
+    ]
+    client.delete_webhook.return_value = True
+
+    new_offset, results = poll_once(client, db, offset=8000, timeout=5)
+    assert new_offset == 8002
+    assert len(results) == 1
+
+    # run_polling with stop_event
+    stop_ev = threading.Event()
+    stop_ev.set()
+    run_polling(stop_event=stop_ev, max_iterations=1)
