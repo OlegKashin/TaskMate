@@ -164,11 +164,11 @@ def test_inbox_card_actions_and_settings(db):
     _text, menu = section_view(db, user, "inbox")
     assert menu["inline_keyboard"]
     settings = db.get(UserSettings, user.id)
-    previous = settings.morning_briefing_enabled
+    previous = settings.weather_enabled
     handle_action(db, user, SimpleNamespace(
-        action="setting_toggle", payload={"field": "morning_briefing_enabled"},
+        action="setting_toggle", payload={"field": "weather_enabled"},
     ))
-    assert settings.morning_briefing_enabled is not previous
+    assert settings.weather_enabled is not previous
 
 
 def test_retryable_ai_error_uses_first_policy_delay(db, monkeypatch):

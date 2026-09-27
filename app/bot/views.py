@@ -31,11 +31,13 @@ def section_view(db, user, section: str) -> tuple[str, dict | None]:
         rows = [
             [_button(db, user, "Утренняя сводка вкл/выкл", "setting_toggle", {"field": "morning_briefing_enabled"})],
             [_button(db, user, "Вечерняя статистика вкл/выкл", "setting_toggle", {"field": "evening_stats_enabled"})],
+            [_button(db, user, "Погода вкл/выкл", "setting_toggle", {"field": "weather_enabled"})],
             [_button(db, user, "Время сводок", "setting_times", {})],
             [_button(db, user, "Проект по умолчанию", "setting_projects", {})],
         ]
         default_project = db.get(Project, settings.default_project_id) if settings.default_project_id else None
-        text += (f"\nПроект по умолчанию: {default_project.name if default_project else 'Inbox'}"
+        text += (f"\nПогода: {'вкл' if settings.weather_enabled else 'выкл'}"
+                 f"\nПроект по умолчанию: {default_project.name if default_project else 'Inbox'}"
                  "\nЧасовой пояс: /timezone Europe/Moscow")
         return text, {"inline_keyboard": rows}
     model = {"tasks": Task, "projects": Project, "inbox": InboxItem,
