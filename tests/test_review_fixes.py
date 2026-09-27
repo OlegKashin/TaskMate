@@ -503,3 +503,243 @@ def test_email_import_analysis_reaches_inbox(db, monkeypatch):
     outcome = tasks.process_message.run(str(job.id))
     item = db.scalar(select(InboxItem).where(InboxItem.user_id == user.id))
     assert outcome["state"] == "proposal" and item.item_type == "task_candidate"
+
+
+def test_task_events_service_and_api(db, client):
+    from app.core.security import issue_user_token
+
+    user = UserService(db).get_or_create(5017)
+    token = issue_user_token(5017)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    task, _ = TaskService(db).create(user, {"title": "Initial Task"})
+    TaskService(db).patch(user, task.id, {"title": "Updated Task"})
+    TaskService(db).change_status(user, task.id, "in_progress")
+
+    events = TaskService(db).events(user, task.id)
+    assert len(events) >= 2
+    assert events[0].event_type == "created"
+
+    response = client.get(f"/api/v1/tasks/{task.id}/events", headers=headers)
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["data"]) >= 2
+    assert data["data"][0]["event_type"] == "created"
+
+
+def test_wake_due_snoozed_and_inbox_filtering(db):
+    from datetime import timedelta
+    from app.bot.presentation import section_message
+    from app.services.domain import InboxService, utcnow
+
+    user = UserService(db).get_or_create(5018)
+    inbox_service = InboxService(db)
+
+    past_due = utcnow() - timedelta(hours=2)
+    item_past = InboxItem(user_id=user.id, title="Past Item", item_type="task_candidate", status="snoozed", snoozed_until=past_due)
+    db.add(item_past)
+
+    future_due = utcnow() + timedelta(hours=5)
+    item_future = InboxItem(user_id=user.id, title="Future Item", item_type="task_candidate", status="snoozed", snoozed_until=future_due)
+    db.add(item_future)
+    db.commit()
+
+    msg = section_message(db, user, "inbox")
+    text, markup = section_view(db, user, "inbox")
+    assert "Future Item" not in msg
+    assert "Future Item" not in text
+
+    woken = inbox_service.wake_due_snoozed()
+    assert woken >= 1
+
+    db.refresh(item_past)
+    assert item_past.status == "proposed"
+    assert item_past.snoozed_until is None
+
+
+def test_task_duplicate_allowed_after_completed_or_cancelled(db):
+    user = UserService(db).get_or_create(5019)
+    source = SourceService(db).create(user, {"type": "telegram_chat", "name": "Chat", "external_source_id": "5019"})
+    message = Message(user_id=user.id, source_id=source.id, external_message_id="msg-dup", message_type="text", text="Hello")
+    db.add(message)
+    db.commit()
+
+    task1, _ = TaskService(db).create(user, {"title": "First Task", "source_message_id": message.id})
+    with pytest.raises(AppError) as exc_info:
+        TaskService(db).create(user, {"title": "Second Task", "source_message_id": message.id})
+    assert exc_info.value.code == "DUPLICATE_TASK"
+
+    TaskService(db).change_status(user, task1.id, "completed")
+
+    task2, _ = TaskService(db).create(user, {"title": "Recreated Task", "source_message_id": message.id})
+    assert task2.id != task1.id
+    assert task2.title == "Recreated Task"
+
+
+def test_bot_slash_commands_and_short_token_resolution(db, client):
+    from app.core.config import get_settings
+
+    user = UserService(db).get_or_create(5020)
+    task, _ = TaskService(db).create(user, {"title": "Old Task Name"})
+    project = ProjectService(db).create(user, {"name": "Old Project Name"})
+    source = SourceService(db).create(user, {"type": "telegram_chat", "name": "Chat", "external_source_id": "5020"})
+    msg = Message(user_id=user.id, source_id=source.id, external_message_id="msg-clarify", message_type="text", text="Help needed")
+    db.add(msg)
+    db.commit()
+
+    secret = get_settings().telegram_webhook_secret
+    headers = {"X-Telegram-Bot-Api-Secret-Token": secret}
+
+    def cmd(text):
+        return client.post("/webhooks/telegram", headers=headers, json={
+            "update_id": uuid.uuid4().int % 10000000,
+            "message": {
+                "message_id": 1,
+                "from": {"id": 5020, "first_name": "Test"},
+                "chat": {"id": 5020, "type": "private"},
+                "text": text,
+            }
+        })
+
+    for slash in ("/tasks", "/projects", "/inbox", "/sources", "/settings"):
+        res = cmd(slash)
+        assert res.status_code == 200
+        assert res.json()["command"] == slash.removeprefix("/")
+
+    token = UIActionService(db).create(user, "task_edit_target", {"id": str(task.id)})
+    res = cmd(f"/task_edit {token} New Brand Title")
+    assert res.status_code == 200
+    db.refresh(task)
+    assert task.title == "New Brand Title"
+
+    prefix = str(task.id)[:8]
+    res = cmd(f"/task_edit {prefix} Prefix Brand Title")
+    assert res.status_code == 200
+    db.refresh(task)
+    assert task.title == "Prefix Brand Title"
+
+    p_token = UIActionService(db).create(user, "project_rename_target", {"id": str(project.id)})
+    res = cmd(f"/project_rename {p_token} Renamed Project")
+    assert res.status_code == 200
+    db.refresh(project)
+    assert project.name == "Renamed Project"
+
+    c_token = UIActionService(db).create(user, "clarify_target", {"message_id": str(msg.id)})
+    res = cmd(f"/clarify {c_token} more details")
+    assert res.status_code == 200
+    assert res.json()["clarification"] is True
+
+
+def test_bot_actions_snooze_calendar_source_waiting_reminder(db):
+    from datetime import timedelta
+    from app.models.entities import CalendarConnection, CalendarEvent
+    from app.services.domain import ReminderService, WaitingService, utcnow
+
+    user = UserService(db).get_or_create(5021)
+    task, _ = TaskService(db).create(user, {"title": "Task for Snooze", "due_at": utcnow()})
+    source = SourceService(db).create(user, {"type": "telegram_chat", "name": "Chat", "external_source_id": "5021"})
+
+    def act(kind, payload):
+        return SimpleNamespace(action=kind, payload=payload)
+
+    orig_due = task.due_at.replace(tzinfo=None) if task.due_at.tzinfo else task.due_at
+    text, markup = handle_action(db, user, act("task_snooze", {"id": str(task.id)}))
+    db.refresh(task)
+    task_due = task.due_at.replace(tzinfo=None) if task.due_at.tzinfo else task.due_at
+    assert task_due > orig_due
+    assert markup["inline_keyboard"][0][0]["text"] == "Отменить"
+
+    cal_conn = CalendarConnection(user_id=user.id, provider="google", status="active", external_account_id="u@example.com")
+    db.add(cal_conn)
+    db.commit()
+    text, _ = handle_action(db, user, act("task_add_calendar", {"task_id": str(task.id)}))
+    assert "добавлено" in text
+    event = db.scalar(select(CalendarEvent).where(CalendarEvent.task_id == task.id))
+    assert event is not None
+    assert event.title == task.title
+
+    assert source.analysis_text is True
+    handle_action(db, user, act("source_setting_toggle", {"id": str(source.id), "field": "analysis_text"}))
+    db.refresh(source)
+    assert source.analysis_text is False
+
+    waiting = WaitingService(db).create(user, {"title": "Waiting for document"})
+    text, markup = handle_action(db, user, act("waiting_open", {"id": str(waiting.id)}))
+    assert "Ожидание" in text and markup["inline_keyboard"]
+    handle_action(db, user, act("waiting_complete", {"id": str(waiting.id)}))
+    db.refresh(waiting)
+    assert waiting.status == "completed"
+    handle_action(db, user, act("waiting_cancel", {"id": str(waiting.id)}))
+    db.refresh(waiting)
+    assert waiting.status == "cancelled"
+
+    rem = ReminderService(db).create(user, {"title": "Reminder 1", "due_at": utcnow() + timedelta(hours=1)})
+    handle_action(db, user, act("reminder_cancel", {"id": str(rem.id)}))
+    db.refresh(rem)
+    assert rem.status == "cancelled"
+
+
+def test_notification_deliver_pending_markups(db):
+    from app.models.entities import Notification
+    from app.services.domain import NotificationService
+
+    user = UserService(db).get_or_create(5022)
+    service = NotificationService(db)
+
+    db.add(Notification(user_id=user.id, type="morning_briefing", payload={"title": "Morning"}))
+    db.add(Notification(user_id=user.id, type="evening_stats", payload={"title": "Evening"}))
+    inbox_item = InboxItem(user_id=user.id, title="Urgent Invoice", item_type="urgent")
+    db.add(inbox_item)
+    db.add(Notification(user_id=user.id, type="urgent_item", payload={"title": "🔴 Срочно", "message_id": None}))
+    db.commit()
+
+    client = Mock()
+    client.send_message.return_value = {"message_id": 999}
+    sent_count = service.deliver_pending(client)
+    assert sent_count == 3
+    assert client.send_message.call_count == 3
+
+    markups = [call.args[2] for call in client.send_message.call_args_list if len(call.args) > 2 and call.args[2]]
+    button_labels = [btn["text"] for m in markups for row in m["inline_keyboard"] for btn in row]
+    assert "Открыть задачи" in button_labels
+    assert "Расписание" in button_labels
+    assert "Задачи на завтра" in button_labels
+    assert "Настройки" in button_labels
+    assert "В Inbox" in button_labels
+
+
+def test_voice_message_processing_echo_and_calendar_suggest(db, monkeypatch):
+    from contextlib import nullcontext
+    from app.models.entities import CalendarConnection
+
+    user = UserService(db).get_or_create(5023)
+    source = SourceService(db).create(user, {"type": "telegram_chat", "name": "Chat", "external_source_id": "5023"})
+    message = Message(
+        user_id=user.id,
+        source_id=source.id,
+        external_message_id="v-1",
+        message_type="voice",
+        text="Купить молоко в 18:00",
+        raw_payload={"message": {"chat": {"id": 5023}}},
+    )
+    db.add(message)
+    db.flush()
+    job = AIProcessingJob(user_id=user.id, message_id=message.id, status="queued")
+    db.add(job)
+
+    cal = CalendarConnection(user_id=user.id, provider="google", status="active", external_account_id="c@example.com")
+    db.add(cal)
+    db.commit()
+
+    monkeypatch.setattr(tasks, "SessionLocal", lambda: nullcontext(db))
+    sent_messages = []
+    fake_client = Mock()
+    fake_client.send_message.side_effect = lambda chat_id, text, markup=None: sent_messages.append((text, markup)) or {"message_id": 1}
+    fake_client.edit_message.side_effect = lambda chat_id, msg_id, text, markup=None: sent_messages.append((text, markup)) or {"message_id": 1}
+    monkeypatch.setattr("app.workers.tasks.TelegramClient", lambda: fake_client)
+
+    tasks.process_message.run(str(job.id))
+    assert len(sent_messages) >= 1
+    sent_text, markup = sent_messages[0]
+    assert "🎤 Я понял: «Купить молоко в 18:00»" in sent_text
+

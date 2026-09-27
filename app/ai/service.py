@@ -12,6 +12,7 @@ from app.core.errors import AppError, not_found
 from app.models.entities import (
     AIProcessingJob,
     CalendarConnection,
+    CalendarEvent,
     InboxItem,
     Message,
     Notification,
@@ -270,7 +271,24 @@ class AIActionService:
             if message:
                 values["source_message_id"] = message.id
             task, undo = TaskService(self.db).create(user, values, "ai")
-            return {"state": "executed", "object_id": str(task.id), "undo": undo}
+            suggest_cal = False
+            if task.due_at and (task.due_at.hour != 0 or task.due_at.minute != 0):
+                has_cal = self.db.scalar(select(CalendarConnection.id).where(
+                    CalendarConnection.user_id == user.id, CalendarConnection.status == "active"
+                ))
+                if has_cal:
+                    has_event = self.db.scalar(select(CalendarEvent.id).where(
+                        CalendarEvent.user_id == user.id, CalendarEvent.task_id == task.id,
+                        CalendarEvent.status != "cancelled",
+                    ))
+                    if not has_event:
+                        suggest_cal = True
+            return {
+                "state": "executed",
+                "object_id": str(task.id),
+                "undo": undo,
+                "suggest_calendar": suggest_cal,
+            }
         if result.intent in {"edit_task", "delete_task", "change_task_status"}:
             target = self._target_task(user, entities["target"])
             if isinstance(target, list):

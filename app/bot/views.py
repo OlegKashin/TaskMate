@@ -2,10 +2,10 @@
 
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from app.ai.service import MUTATING_INTENTS
-from app.bot.presentation import section_message
+from app.bot.presentation import local_time, section_message
 from app.models.entities import (
     AIProcessingJob,
     CalendarEvent,
@@ -17,7 +17,7 @@ from app.models.entities import (
     UserSettings,
 )
 from app.schemas.domain import AIResult
-from app.services.domain import UIActionService
+from app.services.domain import UIActionService, utcnow
 
 
 def _button(db, user, label: str, action: str, payload: dict) -> dict:
@@ -48,7 +48,12 @@ def section_view(db, user, section: str) -> tuple[str, dict | None]:
     if model is Task:
         query = query.where(Task.deleted_at.is_(None))
     if model is InboxItem:
-        query = query.where(InboxItem.status.in_(["new", "proposed", "snoozed"]))
+        query = query.where(
+            or_(
+                InboxItem.status.in_(["new", "proposed"]),
+                and_(InboxItem.status == "snoozed", or_(InboxItem.snoozed_until.is_(None), InboxItem.snoozed_until <= utcnow())),
+            )
+        )
     if model is CalendarEvent:
         query = query.where(CalendarEvent.status != "cancelled").order_by(CalendarEvent.start_at)
     else:
@@ -123,20 +128,74 @@ def object_view(db, user, section: str, object_id: uuid.UUID) -> tuple[str, dict
                 "id": str(item.id),
             })])
     elif section == "tasks":
-        text = f"✅ {item.title}\nСтатус: {item.status}\nПриоритет: {item.priority}"
-        rows = [[_button(db, user, "Изменить", "task_edit_prompt", {"id": str(item.id)})],
-                [_button(db, user, "Выполнено…", "task_complete_prompt", {"id": str(item.id)})],
-                [_button(db, user, "Удалить…", "task_delete_prompt", {"id": str(item.id)})]]
+        status_labels = {
+            "new": "🆕 Новая",
+            "in_progress": "🔄 В работе",
+            "completed": "✅ Выполнена",
+            "cancelled": "🚫 Отменена",
+        }
+        priority_labels = {
+            "low": "🟢 Низкий",
+            "normal": "🟡 Обычный",
+            "high": "🔴 Высокий",
+        }
+        try:
+            from zoneinfo import ZoneInfo
+            zone = ZoneInfo(user.timezone)
+        except Exception:
+            from zoneinfo import ZoneInfo
+            zone = ZoneInfo("UTC")
+        if item.due_at:
+            due_dt = local_time(item.due_at, zone)
+            due_str = f"{due_dt:%d.%m.%Y %H:%M}" if (due_dt.hour or due_dt.minute) else f"{due_dt:%d.%m.%Y}"
+        else:
+            due_str = "Без срока"
+        project = db.get(Project, item.project_id) if item.project_id else None
+        project_name = project.name if project else "Без проекта"
+        source = None
+        if item.source_message_id:
+            msg = db.get(Message, item.source_message_id)
+            if msg and msg.source_id:
+                source = db.get(Source, msg.source_id)
+        source_name = source.name if source else "Ручной ввод"
+        desc = item.description if item.description else "отсутствует"
+        text = (
+            f"✅ {item.title}\n"
+            f"Статус: {status_labels.get(item.status, item.status)}\n"
+            f"Срок: {due_str}\n"
+            f"Приоритет: {priority_labels.get(item.priority, item.priority)}\n"
+            f"Проект: {project_name}\n"
+            f"Источник: {source_name}\n"
+            f"Описание: {desc}"
+        )
+        rows = []
+        if item.status != "completed":
+            rows.append([_button(db, user, "Выполнить", "task_complete_prompt", {"id": str(item.id)})])
+        rows.append([_button(db, user, "Изменить", "task_edit_prompt", {"id": str(item.id)})])
+        rows.append([_button(db, user, "Отложить на 1 день", "task_snooze", {"id": str(item.id)})])
+        rows.append([_button(db, user, "Удалить…", "task_delete_prompt", {"id": str(item.id)})])
     elif section == "projects":
         text = f"📁 {item.name}\n{'Архив' if item.is_archived else 'Активен'}"
         rows = [[_button(db, user, "Переименовать", "project_rename_prompt", {"id": str(item.id)})],
                 [_button(db, user, "Архивировать", "project_archive", {"id": str(item.id)})],
                 [_button(db, user, "Удалить…", "project_delete_prompt", {"id": str(item.id)})]]
     else:
-        text = f"🔗 {item.name}\nТип: {item.type}\nСтатус: {item.status}"
-        rows = [[_button(db, user, "Проекты источника", "source_projects_view", {
-            "id": str(item.id),
-        })]]
+        text = (
+            f"🔗 {item.name}\n"
+            f"Тип: {item.type}\n"
+            f"Статус: {item.status}\n"
+            f"Анализ текста: {'вкл' if item.analysis_text else 'выкл'}\n"
+            f"Анализ голосовых: {'вкл' if item.analysis_voice else 'выкл'}\n"
+            f"Сохранять вложения: {'вкл' if item.save_attachments else 'выкл'}"
+        )
+        rows = [
+            [_button(db, user, "Проекты источника", "source_projects_view", {"id": str(item.id)})],
+            [
+                _button(db, user, f"Текст: {'вкл' if item.analysis_text else 'выкл'}", "source_setting_toggle", {"id": str(item.id), "field": "analysis_text"}),
+                _button(db, user, f"Голос: {'вкл' if item.analysis_voice else 'выкл'}", "source_setting_toggle", {"id": str(item.id), "field": "analysis_voice"}),
+                _button(db, user, f"Вложения: {'вкл' if item.save_attachments else 'выкл'}", "source_setting_toggle", {"id": str(item.id), "field": "save_attachments"}),
+            ],
+        ]
         if item.type in {"gmail", "yandex", "mailru", "imap"} and item.status == "active":
             rows.append([_button(db, user, "Выбрать папки", "folder_refresh", {"id": str(item.id)})])
         if item.status in {"active", "paused"}:

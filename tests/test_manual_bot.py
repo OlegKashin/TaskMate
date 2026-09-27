@@ -75,9 +75,9 @@ def test_manual_project_and_task_card_actions(db):
     task, _ = TaskService(db).create(user, {"title": "Draft", "project_id": project.id})
     _, markup = object_view(db, user, "tasks", task.id)
     assert [row[0]["text"] for row in markup["inline_keyboard"]] == [
-        "Изменить", "Выполнено…", "Удалить…",
+        "Выполнить", "Изменить", "Отложить на 1 день", "Удалить…",
     ]
-    prompt = UIActionService(db).consume(user, markup["inline_keyboard"][1][0]["callback_data"])
+    prompt = UIActionService(db).consume(user, markup["inline_keyboard"][0][0]["callback_data"])
     text, confirm = handle_action(db, user, prompt)
     assert "выполненной" in text
     assert task.status != "completed"

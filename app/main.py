@@ -29,29 +29,48 @@ async def request_context(request: Request, call_next):
 
 @app.exception_handler(AppError)
 async def app_error(request: Request, exc: AppError):
+    request_id = getattr(request.state, "request_id", None)
     return JSONResponse(
         status_code=exc.status_code,
+        media_type="application/problem+json",
         content={
+            "type": f"https://taskmate.ai/errors/{exc.code}",
+            "title": exc.code.replace("_", " ").title(),
+            "status": exc.status_code,
+            "detail": exc.message,
+            "instance": request.url.path,
+            "code": exc.code,
+            "request_id": request_id,
             "error": {
                 "code": exc.code,
                 "message": exc.message,
-                "request_id": request.state.request_id,
-            }
+                "request_id": request_id,
+            },
         },
     )
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_error(request: Request, exc: RequestValidationError):
+    request_id = getattr(request.state, "request_id", None)
     return JSONResponse(
         status_code=422,
+        media_type="application/problem+json",
         content={
+            "type": "https://taskmate.ai/errors/VALIDATION_ERROR",
+            "title": "Validation Error",
+            "status": 422,
+            "detail": "Request validation failed",
+            "instance": request.url.path,
+            "code": "VALIDATION_ERROR",
+            "details": exc.errors(),
+            "request_id": request_id,
             "error": {
                 "code": "VALIDATION_ERROR",
                 "message": "Request validation failed",
                 "details": exc.errors(),
-                "request_id": request.state.request_id,
-            }
+                "request_id": request_id,
+            },
         },
     )
 

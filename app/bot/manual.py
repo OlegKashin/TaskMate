@@ -66,8 +66,22 @@ def handle_task_draft_action(db, user, kind: str, draft: dict, payload: dict):
             task, undo = TaskService(db).patch(user, uuid.UUID(task_id), values)
         else:
             task, undo = TaskService(db).create(user, values)
+        suggest_cal = False
+        if task.due_at and (task.due_at.hour != 0 or task.due_at.minute != 0):
+            from app.models.entities import CalendarConnection, CalendarEvent
+            has_cal = db.scalar(select(CalendarConnection.id).where(
+                CalendarConnection.user_id == user.id, CalendarConnection.status == "active"
+            ))
+            if has_cal:
+                has_event = db.scalar(select(CalendarEvent.id).where(
+                    CalendarEvent.user_id == user.id, CalendarEvent.task_id == task.id,
+                    CalendarEvent.status != "cancelled",
+                ))
+                if not has_event:
+                    suggest_cal = True
         return outcome_message(db, user, {
             "state": "executed", "object_id": str(task.id), "undo": undo,
+            "suggest_calendar": suggest_cal,
         })
     if kind == "task_draft_due":
         token = UIActionService(db).create(user, "task_due_input", {"draft": draft})

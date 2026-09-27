@@ -16,13 +16,16 @@ from app.bot.views import (
     source_projects_view,
 )
 from app.core.errors import AppError
-from app.models.entities import Message, Project, UserSettings
+from app.models.entities import CalendarConnection, Message, Project, UserSettings
 from app.services.domain import (
     CalendarService,
     InboxService,
     ProjectService,
+    ReminderService,
     SourceService,
     TaskService,
+    UIActionService,
+    WaitingService,
     utcnow,
 )
 from app.services.email import EmailService
@@ -40,6 +43,8 @@ ACTIONS = {
     "task_draft_set_priority", "task_edit_prompt", "task_complete_prompt",
     "project_new_prompt", "project_create_confirm", "project_rename_prompt",
     "project_delete_prompt", "project_delete",
+    "task_snooze", "task_add_calendar", "source_setting_toggle",
+    "waiting_open", "waiting_complete", "waiting_cancel", "reminder_cancel",
 }
 
 
@@ -93,7 +98,8 @@ def handle_action(db, user, action) -> tuple[str, dict | None]:
         if operation == "clarify":
             if not item.message_id:
                 return "Исходное сообщение недоступно.", None
-            return f"Напишите: /clarify {item.message_id} <уточнение>", None
+            token = UIActionService(db).create(user, "clarify_target", {"message_id": str(item.message_id)}, ttl_seconds=3600)
+            return f"Напишите: /clarify {token} <уточнение>", None
         if operation == "reply":
             message = db.get(Message, item.message_id) if item.message_id else None
             if not message or message.message_type != "email":
@@ -129,8 +135,9 @@ def handle_action(db, user, action) -> tuple[str, dict | None]:
             _button(db, user, "Не сейчас", "tasks_open", {"id": str(task.id)}),
         ]]}
     if kind == "task_edit_prompt":
+        token = UIActionService(db).create(user, "task_edit_target", {"id": payload["id"]}, ttl_seconds=3600)
         text, markup = edit_task_draft(db, user, uuid.UUID(payload["id"]))
-        return text + f"\nНазвание: /task_edit {payload['id']} <новое название>", markup
+        return text + f"\nНазвание: /task_edit {token} <новое название>", markup
     if kind == "task_delete_prompt":
         task = TaskService(db).get(user, uuid.UUID(payload["id"]))
         return f"Удалить задачу «{task.title}»?", {"inline_keyboard": [[
@@ -145,7 +152,8 @@ def handle_action(db, user, action) -> tuple[str, dict | None]:
         return f"Проект «{project.name}» архивирован.", None
     if kind == "project_rename_prompt":
         project = ProjectService(db).get(user, uuid.UUID(payload["id"]))
-        return f"Чтобы переименовать «{project.name}», напишите: /project_rename {project.id} <новое название>", None
+        token = UIActionService(db).create(user, "project_rename_target", {"id": str(project.id)}, ttl_seconds=3600)
+        return f"Чтобы переименовать «{project.name}», напишите: /project_rename {token} <новое название>", None
     if kind == "project_delete_prompt":
         project = ProjectService(db).get(user, uuid.UUID(payload["id"]))
         return (f"Удалить проект «{project.name}»? Задачи сохранятся в Inbox. "
@@ -238,4 +246,59 @@ def handle_action(db, user, action) -> tuple[str, dict | None]:
         settings.default_project_id = project_id
         db.commit()
         return section_view(db, user, "settings")
+    if kind == "task_snooze":
+        task_id = uuid.UUID(payload["id"])
+        task = TaskService(db).get(user, task_id)
+        base = task.due_at or utcnow()
+        new_due = base + timedelta(days=1)
+        task, undo = TaskService(db).patch(user, task_id, {"due_at": new_due})
+        return outcome_message(db, user, {"state": "executed", "object_id": str(task.id), "undo": undo})
+    if kind == "task_add_calendar":
+        task_id = uuid.UUID(payload["task_id"])
+        task = TaskService(db).get(user, task_id)
+        connection = db.scalar(
+            select(CalendarConnection).where(
+                CalendarConnection.user_id == user.id, CalendarConnection.status == "active"
+            )
+        )
+        if not connection:
+            return "Подключение Google Calendar не найдено.", None
+        start = task.due_at or utcnow()
+        end = start + timedelta(hours=1)
+        event = CalendarService(db).create(user, {
+            "connection_id": connection.id,
+            "title": task.title,
+            "description": task.description,
+            "start_at": start,
+            "end_at": end,
+            "task_id": task.id,
+        })
+        return f"📅 Событие «{event.title}» добавлено в Google Calendar.", None
+    if kind == "source_setting_toggle":
+        source_id = uuid.UUID(payload["id"])
+        source = SourceService(db).get(user, source_id)
+        field = payload["field"]
+        if field in {"analysis_text", "analysis_voice", "save_attachments"}:
+            new_val = not getattr(source, field)
+            SourceService(db).patch(user, source_id, {field: new_val})
+        return object_view(db, user, "sources", source_id)
+    if kind == "waiting_open":
+        item = WaitingService(db).get(user, uuid.UUID(payload["id"]))
+        text = f"⏳ Ожидание: {item.title}\nСтатус: {item.status}"
+        rows = []
+        if item.status in {"active", "pending"}:
+            rows.append([
+                _button(db, user, "Завершено", "waiting_complete", {"id": str(item.id)}),
+                _button(db, user, "Отменить", "waiting_cancel", {"id": str(item.id)}),
+            ])
+        return text, {"inline_keyboard": rows} if rows else None
+    if kind == "waiting_complete":
+        WaitingService(db).transition(user, uuid.UUID(payload["id"]), "completed")
+        return "Ожидание отмечено завершённым.", None
+    if kind == "waiting_cancel":
+        WaitingService(db).transition(user, uuid.UUID(payload["id"]), "cancelled")
+        return "Ожидание отменено.", None
+    if kind == "reminder_cancel":
+        ReminderService(db).cancel(user, uuid.UUID(payload["id"]))
+        return "Напоминание отменено.", None
     return "Действие недоступно.", None

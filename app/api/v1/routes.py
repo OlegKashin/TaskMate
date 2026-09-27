@@ -159,6 +159,11 @@ def undo_task(object_id: uuid.UUID, token: str, db: DB, user: CurrentUser):
     return ok(TaskService(db).undo(user, token, expected_task_id=object_id))
 
 
+@router.get("/tasks/{object_id}/events")
+def task_events(object_id: uuid.UUID, db: DB, user: CurrentUser):
+    return ok(TaskService(db).events(user, object_id))
+
+
 @router.get("/sources")
 def sources(
     db: DB, user: CurrentUser, limit: int = Query(20, le=100), offset: int = Query(0, ge=0)

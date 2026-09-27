@@ -23,6 +23,7 @@ from app.models.entities import (
 from app.services.attachments import save_telegram_attachment
 from app.services.domain import (
     CalendarService,
+    InboxService,
     NotificationService,
     ReminderService,
     UIActionService,
@@ -105,6 +106,8 @@ def process_message(self, job_id: str):
             raise
         if chat_id is not None:
             text, markup = outcome_message(db, user, outcome)
+            if message.message_type == "voice" and message.text:
+                text = f"🎤 Я понял: «{message.text}»\n\n{text}"
             client = TelegramClient()
             if job.status_message_id:
                 client.edit_message(chat_id, job.status_message_id, text, markup)
@@ -152,6 +155,7 @@ def sync_mail_source(self, source_id: str):
 def schedule_tick():
     with SessionLocal() as db:
         fired = ReminderService(db).fire_due()
+        woken_inbox = InboxService(db).wake_due_snoozed()
         notifications = NotificationService(db)
         briefings = notifications.enqueue_briefings()
         sent = notifications.deliver_pending()
@@ -168,7 +172,14 @@ def schedule_tick():
             except Exception:
                 pass
         mail = {"sources": len(source_ids), "queued": queued}
-        return {"reminders_fired": fired, "briefings_created": briefings, "notifications_sent": sent, "calendar_events_synced": events, "mail": mail}
+        return {
+            "reminders_fired": fired,
+            "inbox_woken": woken_inbox,
+            "briefings_created": briefings,
+            "notifications_sent": sent,
+            "calendar_events_synced": events,
+            "mail": mail,
+        }
 
 
 @celery_app.task

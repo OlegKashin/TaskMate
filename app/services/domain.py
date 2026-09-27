@@ -225,6 +225,7 @@ class TaskService(OwnedService):
                     Task.user_id == user.id,
                     Task.source_message_id == values["source_message_id"],
                     Task.deleted_at.is_(None),
+                    Task.status.not_in(["completed", "cancelled"]),
                 )
             )
             if duplicate:
@@ -348,6 +349,16 @@ class TaskService(OwnedService):
         self._event(task, "undo", event.new_value, event.old_value, "undo")
         self.db.commit()
         return task
+
+    def events(self, user: User, task_id: uuid.UUID) -> list[TaskEvent]:
+        self.get(user, task_id, include_deleted=True)
+        return list(
+            self.db.scalars(
+                select(TaskEvent)
+                .where(TaskEvent.task_id == task_id, TaskEvent.user_id == user.id)
+                .order_by(TaskEvent.created_at.asc())
+            ).all()
+        )
 
 
 class UIActionService:
@@ -538,6 +549,21 @@ class InboxService(OwnedService):
         self.db.commit()
         return item
 
+    def wake_due_snoozed(self, now: datetime | None = None) -> int:
+        now = now or utcnow()
+        items = self.db.scalars(
+            select(InboxItem).where(
+                InboxItem.status == "snoozed",
+                InboxItem.snoozed_until <= now,
+            )
+        ).all()
+        for item in items:
+            item.status = "proposed"
+            item.snoozed_until = None
+        if items:
+            self.db.commit()
+        return len(items)
+
     def reply(self, user: User, item_id: uuid.UUID, draft_text: str) -> str:
         item = self.get(user, item_id)
         message = self.db.get(Message, item.message_id) if item.message_id else None
@@ -684,14 +710,60 @@ class NotificationService(OwnedService):
             if not user or not user.is_active:
                 self.db.commit()
                 continue
+            markup = None
             if notification.type == "morning_briefing":
                 body = section_message(self.db, user, "today")
+                t_token = UIActionService(self.db).create(
+                    user, "navigate", {"section": "tasks"}, ttl_seconds=86400, commit=False
+                )
+                s_token = UIActionService(self.db).create(
+                    user, "navigate", {"section": "schedule"}, ttl_seconds=86400, commit=False
+                )
+                markup = {"inline_keyboard": [[
+                    {"text": "Открыть задачи", "callback_data": t_token},
+                    {"text": "Расписание", "callback_data": s_token},
+                ]]}
             elif notification.type == "evening_stats":
                 body = section_message(self.db, user, "stats")
-            else:
+                t_token = UIActionService(self.db).create(
+                    user, "navigate", {"section": "tasks"}, ttl_seconds=86400, commit=False
+                )
+                cfg_token = UIActionService(self.db).create(
+                    user, "navigate", {"section": "settings"}, ttl_seconds=86400, commit=False
+                )
+                markup = {"inline_keyboard": [[
+                    {"text": "Задачи на завтра", "callback_data": t_token},
+                    {"text": "Настройки", "callback_data": cfg_token},
+                ]]}
+            elif notification.type == "urgent_item":
                 body = notification.payload.get("title") or notification.type
-            markup = None
-            if notification.type == "calendar_error" and notification.payload.get("event_id"):
+                msg_id = notification.payload.get("message_id")
+                inbox_item = None
+                if msg_id:
+                    inbox_item = self.db.scalar(
+                        select(InboxItem).where(
+                            InboxItem.user_id == user.id, InboxItem.message_id == uuid.UUID(msg_id)
+                        )
+                    )
+                buttons = []
+                if inbox_item:
+                    task_token = UIActionService(self.db).create(
+                        user, "inbox_action", {"id": str(inbox_item.id), "operation": "create_task"},
+                        ttl_seconds=86400, commit=False,
+                    )
+                    buttons.append({"text": "Создать задачу", "callback_data": task_token})
+                    inbox_token = UIActionService(self.db).create(
+                        user, "inbox_open", {"id": str(inbox_item.id)}, ttl_seconds=86400, commit=False
+                    )
+                    buttons.append({"text": "В Inbox", "callback_data": inbox_token})
+                else:
+                    inbox_sec_token = UIActionService(self.db).create(
+                        user, "navigate", {"section": "inbox"}, ttl_seconds=86400, commit=False
+                    )
+                    buttons.append({"text": "В Inbox", "callback_data": inbox_sec_token})
+                markup = {"inline_keyboard": [buttons]}
+            elif notification.type == "calendar_error" and notification.payload.get("event_id"):
+                body = notification.payload.get("title") or notification.type
                 event = self.db.get(CalendarEvent, uuid.UUID(notification.payload["event_id"]))
                 if event and event.user_id == user.id:
                     if self.db.get(CalendarConnection, event.connection_id).status == "active":
@@ -704,6 +776,8 @@ class NotificationService(OwnedService):
                     markup = {"inline_keyboard": [[
                         {"text": label, "callback_data": token},
                     ]]}
+            else:
+                body = notification.payload.get("title") or notification.type
             try:
                 response = (client.send_message(user.telegram_user_id, body, markup)
                             if markup else client.send_message(user.telegram_user_id, body))

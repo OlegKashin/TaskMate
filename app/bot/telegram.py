@@ -22,7 +22,9 @@ from app.models.entities import (
     Message,
     Project,
     Source,
+    Task,
     TelegramUpdate,
+    UIAction,
     User,
     UserSettings,
 )
@@ -91,6 +93,40 @@ def send_oauth_link(db, user, chat_id: int, provider: str):
         {"inline_keyboard": [[{"text": "Подключить", "url": url}]]},
     )
     return state
+
+
+def resolve_target_id(db, user, raw_id: str, model_cls) -> uuid.UUID:
+    raw = raw_id.strip()
+    try:
+        return uuid.UUID(raw)
+    except ValueError:
+        pass
+    if raw.startswith("a:") or len(raw) <= 12:
+        try:
+            from app.services.domain import from_base36
+            action_id = from_base36(raw.removeprefix("a:"))
+            action = db.get(UIAction, action_id)
+            if action and action.user_id == user.id:
+                target_str = (
+                    action.payload.get("id")
+                    or action.payload.get("task_id")
+                    or action.payload.get("project_id")
+                    or action.payload.get("message_id")
+                )
+                if target_str:
+                    return uuid.UUID(target_str)
+        except Exception:
+            pass
+    from sqlalchemy import String, cast
+    match = db.scalar(
+        select(model_cls.id).where(
+            model_cls.user_id == user.id,
+            cast(model_cls.id, String).like(f"{raw}%"),
+        )
+    )
+    if match:
+        return match
+    raise AppError("VALIDATION_ERROR", f"Invalid {model_cls.__name__} ID", 422)
 
 
 @router.post("/webhooks/telegram")
@@ -465,8 +501,11 @@ def telegram_webhook(
             db.commit()
             return {"ok": True, "command": command.removeprefix("/")}
         try:
-            object_id = uuid.UUID(parts[1])
-        except ValueError as exc:
+            target_model = Task if command == "/task_edit" else Project
+            object_id = resolve_target_id(db, user, parts[1], target_model)
+        except AppError:
+            raise
+        except Exception as exc:
             raise AppError("VALIDATION_ERROR", "Invalid object ID", 422) from exc
         title = parts[2].strip()
         if command == "/task_edit":
@@ -489,8 +528,10 @@ def telegram_webhook(
         if len(args) < 3:
             raise AppError("VALIDATION_ERROR", "Use /reply <message-id> <text>", 422)
         try:
-            target = uuid.UUID(args[1])
-        except ValueError as exc:
+            target = resolve_target_id(db, user, args[1], Message)
+        except AppError:
+            raise
+        except Exception as exc:
             raise AppError("VALIDATION_ERROR", "Invalid message ID", 422) from exc
         token = EmailService(db).draft_for_message(user, target, args[2])
         text, markup = outcome_message(
@@ -513,8 +554,10 @@ def telegram_webhook(
             db.commit()
             return {"ok": True, "clarification": False}
         try:
-            original_id = uuid.UUID(parts[1])
-        except ValueError as exc:
+            original_id = resolve_target_id(db, user, parts[1], Message)
+        except AppError:
+            raise
+        except Exception as exc:
             raise AppError("VALIDATION_ERROR", "Invalid message ID", 422) from exc
         original = db.get(Message, original_id)
         if not original or original.user_id != user.id:
@@ -645,7 +688,19 @@ def telegram_webhook(
         )
         db.commit()
         return {"ok": True, "command": command.removeprefix("/")}
-    if command in {"/today", "/schedule", "/stats", "/analyze", "/settings"}:
+    if command in {
+        "/today",
+        "/schedule",
+        "/stats",
+        "/analyze",
+        "/settings",
+        "/tasks",
+        "/projects",
+        "/inbox",
+        "/sources",
+    }:
+        sec = command.removeprefix("/")
+        markup = None
         if command == "/analyze":
             analysis = queue_source_analysis(db, user)
             response = (
@@ -657,11 +712,13 @@ def telegram_webhook(
                 response += "\nСинхронизация почты запущена в фоне."
             elif analysis.get("external_sync") == "broker_unavailable":
                 response += "\nОчередь синхронизации почты недоступна."
+        elif sec in {"tasks", "projects", "inbox", "sources", "settings"}:
+            response, markup = section_view(db, user, sec)
         else:
-            response = section_message(db, user, command.removeprefix("/"))
-        TelegramClient().send_message(chat_id, response)
+            response = section_message(db, user, sec)
+        TelegramClient().send_message(chat_id, response, markup)
         db.commit()
-        return {"ok": True, "command": command.removeprefix("/")}
+        return {"ok": True, "command": sec}
     chat_type = chat.get("type", "private")
     source_type = {
         "private": "telegram_chat",

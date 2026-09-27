@@ -1,11 +1,11 @@
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models.entities import CalendarEvent, InboxItem, Project, Source, Task, User, UserSettings
-from app.services.domain import UIActionService
+from app.services.domain import UIActionService, utcnow
 
 
 def outcome_message(db: Session, user: User, outcome: dict) -> tuple[str, dict | None]:
@@ -77,11 +77,16 @@ def outcome_message(db: Session, user: User, outcome: dict) -> tuple[str, dict |
         return text, {"inline_keyboard": [buttons]}
     if state == "executed":
         text = "✅ Действие выполнено."
+        buttons = []
+        if outcome.get("suggest_calendar") and outcome.get("object_id"):
+            text += "\n📅 Добавить в Google Calendar?"
+            add_cal = UIActionService(db).create(
+                user, "task_add_calendar", {"task_id": outcome["object_id"]}
+            )
+            buttons.append({"text": "Да, добавить", "callback_data": add_cal})
         if outcome.get("undo"):
-            return text, {"inline_keyboard": [[
-                {"text": "Отменить", "callback_data": outcome["undo"]}
-            ]]}
-        return text, None
+            buttons.append({"text": "Отменить", "callback_data": outcome["undo"]})
+        return text, {"inline_keyboard": [buttons]} if buttons else None
     if state == "search_results":
         tasks = outcome.get("tasks", [])
         if not tasks:
@@ -139,7 +144,9 @@ def section_message(db: Session, user: User, section: str) -> str:
         )) or 0
         lines = ["☀️ Сегодня"]
         lines.extend(f"{local_time(event.start_at, zone):%H:%M} — {event.title}" for event in events)
-        lines.extend(f"{local_time(task.due_at, zone):%H:%M} — {task.title}" for task in tasks)
+        for task in tasks:
+            icon = "🔴 " if task.priority == "high" else ""
+            lines.append(f"{icon}{local_time(task.due_at, zone):%H:%M} — {task.title}")
         if not events and not tasks:
             lines.append("На сегодня задач и событий нет.")
         if overdue:
@@ -152,7 +159,14 @@ def section_message(db: Session, user: User, section: str) -> str:
         completed = db.scalar(select(func.count()).select_from(Task).where(
             Task.user_id == user.id, Task.completed_at >= start, Task.completed_at < end,
         )) or 0
-        return f"🌙 Итоги дня\nСоздано задач: {created}\nВыполнено: {completed}"
+        tomorrow_start = end
+        tomorrow_end = (day_start + timedelta(days=2)).astimezone(UTC)
+        tomorrow = db.scalar(select(func.count()).select_from(Task).where(
+            Task.user_id == user.id, Task.deleted_at.is_(None),
+            Task.status.not_in(["completed", "cancelled"]),
+            Task.due_at >= tomorrow_start, Task.due_at < tomorrow_end,
+        )) or 0
+        return f"🌙 Итоги дня\nСоздано задач: {created}\nВыполнено: {completed}\nЗавтра: {tomorrow} задач"
     if section == "settings":
         settings = db.get(UserSettings, user.id)
         return (f"⚙️ Настройки\nЧасовой пояс: {user.timezone}\n"
@@ -164,7 +178,12 @@ def section_message(db: Session, user: User, section: str) -> str:
         if model is Task:
             conditions.append(Task.deleted_at.is_(None))
         if model is InboxItem:
-            conditions.append(InboxItem.status.in_(["new", "proposed", "snoozed"]))
+            conditions.append(
+                or_(
+                    InboxItem.status.in_(["new", "proposed"]),
+                    and_(InboxItem.status == "snoozed", or_(InboxItem.snoozed_until.is_(None), InboxItem.snoozed_until <= utcnow())),
+                )
+            )
         items = db.scalars(select(model).where(*conditions).limit(10)).all()
         heading = {"tasks": "Задачи", "projects": "Проекты", "inbox": "Inbox", "sources": "Источники"}[section]
         return f"{heading}\n" + ("\n".join(
