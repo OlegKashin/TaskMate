@@ -19,6 +19,7 @@ from app.models.entities import (
     Source,
     Task,
     User,
+    UserSettings,
 )
 from app.schemas.domain import AIAction, AIResult
 from app.services.domain import (
@@ -167,9 +168,11 @@ class AIActionService:
                     "result": result.model_dump(mode="json"),
                     "message_id": str(message.id),
                 }
+            settings = self.db.get(UserSettings, user.id)
+            default_proj = str(settings.default_project_id) if settings and settings.default_project_id else None
             result = result.model_copy(update={
                 "entities": {**result.entities,
-                             "project_id": str(projects[0].id) if projects else None},
+                             "project_id": str(projects[0].id) if projects else default_proj},
             })
         if result.intent in {"edit_task", "delete_task", "change_task_status"}:
             try:

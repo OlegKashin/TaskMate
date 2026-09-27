@@ -22,6 +22,7 @@ from app.models.entities import (
     Source,
     SourceCredential,
     SourceFolder,
+    Task,
     UserSettings,
 )
 from app.schemas.domain import AIAction, AIResult
@@ -743,3 +744,151 @@ def test_voice_message_processing_echo_and_calendar_suggest(db, monkeypatch):
     sent_text, markup = sent_messages[0]
     assert "🎤 Я понял: «Купить молоко в 18:00»" in sent_text
 
+
+
+def test_ai_task_respects_default_project_id_when_source_has_no_project(db):
+    user = UserService(db).get_or_create(5030)
+    proj = ProjectService(db).create(user, {"name": "Default Proj"})
+    settings = db.get(UserSettings, user.id)
+    settings.default_project_id = proj.id
+    db.commit()
+
+    # 1. Direct TaskService.create with project_id: None or missing
+    task1, _ = TaskService(db).create(user, {"title": "Task 1", "project_id": None})
+    assert task1.project_id == proj.id
+
+    task2, _ = TaskService(db).create(user, {"title": "Task 2"})
+    assert task2.project_id == proj.id
+
+    # 2. AIService._interpret_source_message with no linked source projects
+    source = Source(user_id=user.id, type="gmail", name="mail", status="active",
+                    external_source_id="b@example.com", connected_at=datetime.now(UTC))
+    db.add(source)
+    db.flush()
+    message = Message(user_id=user.id, source_id=source.id, external_message_id="msg-no-proj",
+                      message_type="email", subject="Test", text="Do this", received_at=datetime.now(UTC))
+    db.add(message)
+    db.commit()
+
+    class DummyProvider:
+        async def interpret(self, text):
+            return AIResult(intent="create_task", confidence=0.9, entities={"title": "Test Task"},
+                            action=AIAction(type="create_task"), reason="Поручение")
+
+    ai_service = AIService(db, DummyProvider())
+    job = AIProcessingJob(user_id=user.id, message_id=message.id)
+    db.add(job)
+    db.commit()
+
+    outcome = asyncio.run(ai_service.process(job, message, user))
+    assert outcome["state"] == "proposal"
+    action = UIActionService(db).consume(user, outcome["token"], "confirm_ai")
+    assert action.payload["result"]["entities"]["project_id"] == str(proj.id)
+    executed = AIActionService(db).execute(user, AIResult.model_validate(action.payload["result"]), message)
+    task = db.get(Task, uuid.UUID(executed["object_id"]))
+    assert task.project_id == proj.id
+
+
+def test_analyze_without_sources_provides_connect_button(db, client):
+    from app.core.config import get_settings
+    user = UserService(db).get_or_create(5031)
+    secret = get_settings().telegram_webhook_secret
+    headers = {"X-Telegram-Bot-Api-Secret-Token": secret}
+
+    res = client.post("/webhooks/telegram", headers=headers, json={
+        "update_id": 7001,
+        "message": {
+            "message_id": 1,
+            "from": {"id": 5031, "first_name": "Test"},
+            "chat": {"id": 5031, "type": "private"},
+            "text": "/analyze",
+        }
+    })
+    assert res.status_code == 200
+    assert res.json()["command"] == "analyze"
+
+    # Verify section_view sources has connect button and settings has timezone button
+    text_src, markup_src = section_view(db, user, "sources")
+    labels_src = [b["text"] for row in markup_src["inline_keyboard"] for b in row]
+    assert "Подключить источник" in labels_src
+
+    # handle_action with source_connect_menu
+    t_conn, m_conn = handle_action(db, user, SimpleNamespace(action="source_connect_menu", payload={}))
+    assert "Подключить почту" in t_conn
+    assert m_conn and "inline_keyboard" in m_conn
+
+    # Check settings view
+    text_set, markup_set = section_view(db, user, "settings")
+    labels_set = [b["text"] for row in markup_set["inline_keyboard"] for b in row]
+    assert "Изменить часовой пояс" in labels_set
+
+    # handle_action with setting_timezone
+    t_tz, m_tz = handle_action(db, user, SimpleNamespace(action="setting_timezone", payload={}))
+    assert "/timezone" in t_tz
+
+
+def test_disambiguation_on_ambiguous_prefix_edit_and_rename(db, client):
+    from app.core.config import get_settings
+    user = UserService(db).get_or_create(5032)
+    # Create two tasks
+    task_a, _ = TaskService(db).create(user, {"title": "Task Alpha"})
+    task_b, _ = TaskService(db).create(user, {"title": "Task Beta"})
+    # Find common prefix or force IDs to have common prefix for testing
+    task_b.id = uuid.UUID(f"{str(task_a.id)[:8]}-0000-0000-0000-000000000002")
+    db.commit()
+
+    prefix = str(task_a.id)[:8]
+    secret = get_settings().telegram_webhook_secret
+    headers = {"X-Telegram-Bot-Api-Secret-Token": secret}
+
+    # /task_edit with ambiguous prefix
+    res = client.post("/webhooks/telegram", headers=headers, json={
+        "update_id": 7002,
+        "message": {
+            "message_id": 2,
+            "from": {"id": 5032, "first_name": "Test"},
+            "chat": {"id": 5032, "type": "private"},
+            "text": f"/task_edit {prefix} Renamed Both",
+        }
+    })
+    assert res.status_code == 200
+    assert res.json().get("ambiguity") is True
+
+    # Test executing disambiguated edit action
+    t_out, m_out = handle_action(db, user, SimpleNamespace(
+        action="task_disambiguate_edit",
+        payload={"id": str(task_a.id), "title": "Renamed Alpha Solo"}
+    ))
+    db.refresh(task_a)
+    assert task_a.title == "Renamed Alpha Solo"
+
+    # Test project disambiguation
+    proj_a = ProjectService(db).create(user, {"name": "Project Alpha"})
+    proj_b = ProjectService(db).create(user, {"name": "Project Beta"})
+    proj_b.id = uuid.UUID(f"{str(proj_a.id)[:8]}-0000-0000-0000-000000000002")
+    db.commit()
+    p_prefix = str(proj_a.id)[:8]
+
+    res_p = client.post("/webhooks/telegram", headers=headers, json={
+        "update_id": 7003,
+        "message": {
+            "message_id": 3,
+            "from": {"id": 5032, "first_name": "Test"},
+            "chat": {"id": 5032, "type": "private"},
+            "text": f"/project_rename {p_prefix} Renamed Proj Ambiguous",
+        }
+    })
+    assert res_p.status_code == 200
+    assert res_p.json().get("ambiguity") is True
+
+    # Execute disambiguated rename
+    t_p, _ = handle_action(db, user, SimpleNamespace(
+        action="project_disambiguate_rename",
+        payload={"id": str(proj_a.id), "name": "Project Alpha Solo"}
+    ))
+    db.refresh(proj_a)
+    assert proj_a.name == "Project Alpha Solo"
+
+    # Cancel AI action
+    t_c, _ = handle_action(db, user, SimpleNamespace(action="cancel_ai", payload={}))
+    assert "отменено" in t_c
