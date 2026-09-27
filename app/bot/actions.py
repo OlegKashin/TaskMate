@@ -218,7 +218,7 @@ def handle_action(db, user, action) -> tuple[str, dict | None]:
         return folders_view(db, user, source_id, int(payload.get("page", 0)))
     if kind == "setting_toggle":
         field = payload["field"]
-        if field not in {"morning_briefing_enabled", "evening_stats_enabled", "weather_enabled"}:
+        if field not in {"morning_briefing_enabled", "evening_stats_enabled"}:
             return "Неизвестная настройка.", None
         settings = db.get(UserSettings, user.id)
         setattr(settings, field, not getattr(settings, field))
