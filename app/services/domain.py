@@ -74,6 +74,15 @@ class UserService:
         return user
 
     def patch(self, user: User, values: dict[str, Any]) -> User:
+        if "timezone" in values and values["timezone"]:
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+            try:
+                ZoneInfo(values["timezone"])
+            except (ZoneInfoNotFoundError, ValueError) as exc:
+                raise AppError(
+                    "VALIDATION_ERROR", f"Unknown timezone: {values['timezone']}", 422
+                ) from exc
         for key, value in values.items():
             setattr(user, key, value)
         self.db.commit()

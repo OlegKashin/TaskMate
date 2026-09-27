@@ -122,7 +122,6 @@ def upgrade():
         sa.Column("morning_briefing_time", sa.Time(), nullable=False),
         sa.Column("evening_stats_enabled", sa.Boolean(), nullable=False),
         sa.Column("evening_stats_time", sa.Time(), nullable=False),
-        sa.Column("weather_enabled", sa.Boolean(), nullable=False),
         sa.Column("default_project_id", sa.Uuid(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),

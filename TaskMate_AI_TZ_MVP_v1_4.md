@@ -361,7 +361,6 @@ morning_briefing_enabled BOOLEAN NOT NULL DEFAULT TRUE
 morning_briefing_time TIME NOT NULL DEFAULT '08:00'
 evening_stats_enabled BOOLEAN NOT NULL DEFAULT TRUE
 evening_stats_time TIME NOT NULL DEFAULT '20:00'
-weather_enabled BOOLEAN NOT NULL DEFAULT FALSE
 default_project_id UUID NULL
 created_at TIMESTAMPTZ NOT NULL
 updated_at TIMESTAMPTZ NOT NULL
@@ -1932,8 +1931,7 @@ send_morning_briefing(user_id)
 - calendar;
 - tasks today;
 - overdue;
-- high priority;
-- optional weather.
+- high priority.
 
 ---
 
