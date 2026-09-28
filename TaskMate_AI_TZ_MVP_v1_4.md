@@ -25,7 +25,7 @@
 - Docker / Docker Compose
 - pytest
 
-> Важное архитектурное решение: HTTP API и Telegram-обработчики должны быть stateless. Telegram поддерживает два режима доставки событий: **Long Polling** (режим по умолчанию, `TELEGRAM_MODE=polling`, не требует публичного IP/SSL и оптимален для локальной разработки, сред за NAT и серверов в РФ) и **Webhook** (`TELEGRAM_MODE=webhook`). Долгие операции — AI, STT, синхронизация источников, proactive analysis и scheduled jobs — выполняются асинхронно через очередь.
+> Важное архитектурное решение: HTTP API и Telegram webhook должны быть stateless. Долгие операции — AI, STT, синхронизация источников, proactive analysis и scheduled jobs — выполняются асинхронно через очередь.
 
 ---
 
@@ -1529,37 +1529,24 @@ AI не имеет права:
 
 # 23. Telegram architecture
 
-## Режимы получения обновлений: Long Polling и Webhook
+Telegram webhook:
 
-Система поддерживает два режима взаимодействия с Telegram Bot API, конфигурируемых параметром `TELEGRAM_MODE`:
+```text
+POST /webhooks/telegram
+```
 
-1. **Long Polling (`TELEGRAM_MODE=polling`, режим по умолчанию)**:
-   - Backend самостоятельно инициирует исходящие HTTPS-запросы к Telegram API (`https://api.telegram.org/bot<token>/getUpdates`) с параметрами `offset` и таймаутом длинного опроса (`timeout=10..30s`).
-   - При старте автоматически сбрасывает существующий вебхук (`deleteWebhook`), разрешая доставку через `getUpdates`.
-   - Не требует публичного белого IP-адреса, доменного имени, открытых входящих портов и SSL-сертификатов — оптимально для локальной разработки, сред за NAT и серверов в РФ.
-   - Запускается как фоновая асинхронная задача в lifespan FastAPI или как независимый процесс `python -m app.bot.polling`.
+Webhook:
 
-2. **Webhook (`TELEGRAM_MODE=webhook`)**:
-   - Telegram отправляет входящие HTTP POST запросы на:
-     ```text
-     POST /webhooks/telegram
-     ```
-   - Валидирует секрет через заголовок `X-Telegram-Bot-Api-Secret-Token` и `TELEGRAM_WEBHOOK_SECRET`.
-   - Требует публичный `PUBLIC_BASE_URL` с валидным SSL-сертификатом.
+1. валидирует Telegram secret;
+2. извлекает `update_id`;
+3. проверяет idempotency через `telegram_updates` (`INSERT ... ON CONFLICT DO NOTHING`, см. §17) — при конфликте апдейт уже обработан, webhook сразу возвращает `200 OK`;
+4. определяет user;
+5. сохраняет входящие данные;
+6. при необходимости создаёт/отправляет промежуточное bot message;
+7. ставит job в Celery;
+8. немедленно возвращает `200 OK`.
 
-## Единый конвейер обработки обновлений (`process_telegram_update`)
-
-Независимо от режима доставки (`polling` или `webhook`), обработка обновлений унифицирована:
-
-1. извлекает `update_id`;
-2. проверяет idempotency через `telegram_updates` (`INSERT ... ON CONFLICT DO NOTHING`, см. §17) — при конфликте апдейт уже обработан, обработка немедленно завершается;
-3. определяет user;
-4. сохраняет входящие данные;
-5. при необходимости создаёт/отправляет промежуточное bot message;
-6. ставит job в Celery;
-7. завершает обработку (в режиме webhook немедленно возвращает `200 OK`, в режиме polling переходит к следующему апдейту).
-
-Обработчик Telegram **никогда не должен ждать** LLM, STT или внешние API.
+Webhook **никогда не должен ждать** LLM, STT или внешние API.
 
 ## Intermediate processing status
 
@@ -2146,14 +2133,9 @@ Encryption key:
 object.user_id == current_user.id
 ```
 
-## Telegram-соединение и безопасность
+## Telegram webhook
 
-- В режиме **Long Polling** (`TELEGRAM_MODE=polling`):
-  - Сервер не открывает входящих портов наружу для Telegram, что исключает прямые входящие атаки.
-  - Параметр `TELEGRAM_WEBHOOK_SECRET` в production не обязателен.
-- В режиме **Webhook** (`TELEGRAM_MODE=webhook`):
-  - Обязательно использовать Telegram webhook secret token (`TELEGRAM_WEBHOOK_SECRET` обязателен при валидации конфигурации в production).
-  - Валидировать заголовок `X-Telegram-Bot-Api-Secret-Token` при каждом входящем запросе к `POST /webhooks/telegram`.
+Использовать Telegram webhook secret token.
 
 ## Logs
 
@@ -2271,7 +2253,6 @@ DATABASE_URL=
 REDIS_URL=
 
 TELEGRAM_BOT_TOKEN=
-TELEGRAM_MODE=polling
 TELEGRAM_WEBHOOK_SECRET=
 
 LLM_PROVIDER=

@@ -505,66 +505,14 @@ def process_telegram_update(db: Session, payload: dict) -> dict:
             TelegramClient().send_message(chat_id, f"Формат: {command} <id> <новое название>")
             db.commit()
             return {"ok": True, "command": command.removeprefix("/")}
-        target_model = Task if command == "/task_edit" else Project
-        title = parts[2].strip()
-        raw = parts[1]
-        is_exact = False
-        object_id = None
         try:
-            object_id = uuid.UUID(raw)
-            is_exact = True
-        except ValueError:
-            pass
-        if not is_exact and (raw.startswith("a:") or len(raw) <= 12):
-            try:
-                from app.services.domain import from_base36
-                action_id = from_base36(raw.removeprefix("a:"))
-                action = db.get(UIAction, action_id)
-                if action and action.user_id == user.id:
-                    target_str = (
-                        action.payload.get("id")
-                        or action.payload.get("task_id")
-                        or action.payload.get("project_id")
-                        or action.payload.get("message_id")
-                    )
-                    if target_str:
-                        object_id = uuid.UUID(target_str)
-                        is_exact = True
-            except Exception:
-                pass
-        if not is_exact:
-            from sqlalchemy import String, cast
-            query = select(target_model).where(
-                target_model.user_id == user.id,
-                cast(target_model.id, String).like(f"{raw}%"),
-            )
-            if target_model is Task:
-                query = query.where(Task.deleted_at.is_(None))
-            elif target_model is Project:
-                query = query.where(Project.is_archived.is_(False))
-            matches = db.scalars(query.limit(10)).all()
-            if len(matches) > 1:
-                item_label = "задачу" if target_model is Task else "проект"
-                lines = [f"Найдено несколько совпадений. Уточните, какую {item_label} вы имеете в виду:"]
-                buttons = []
-                for idx, match in enumerate(matches, 1):
-                    if target_model is Task:
-                        proj_name = db.get(Project, match.project_id).name if match.project_id else "Inbox"
-                        lines.append(f"{idx}. {match.title} (Проект: {proj_name})")
-                        tok = UIActionService(db).create(user, "task_disambiguate_edit", {"id": str(match.id), "title": title})
-                    else:
-                        lines.append(f"{idx}. {match.name}")
-                        tok = UIActionService(db).create(user, "project_disambiguate_rename", {"id": str(match.id), "name": title})
-                    buttons.append({"text": str(idx), "callback_data": tok})
-                cancel_tok = UIActionService(db).create(user, "cancel_ai", {})
-                keyboard = [buttons, [{"text": "Отмена", "callback_data": cancel_tok}]]
-                TelegramClient().send_message(chat_id, "\n".join(lines), {"inline_keyboard": keyboard})
-                db.commit()
-                return {"ok": True, "command": command.removeprefix("/"), "ambiguity": True}
-            elif len(matches) == 1:
-                object_id = matches[0].id
-            else:
-                raise AppError("VALIDATION_ERROR", f"Invalid {target_model.__name__} ID", 422)
+            target_model = Task if command == "/task_edit" else Project
+            object_id = resolve_target_id(db, user, parts[1], target_model)
+        except AppError:
+            raise
+        except Exception as exc:
+            raise AppError("VALIDATION_ERROR", "Invalid object ID", 422) from exc
+        title = parts[2].strip()
         if command == "/task_edit":
             if len(title) > 500:
                 raise AppError("VALIDATION_ERROR", "Название задачи слишком длинное", 422)
@@ -760,17 +708,15 @@ def process_telegram_update(db: Session, payload: dict) -> dict:
         markup = None
         if command == "/analyze":
             analysis = queue_source_analysis(db, user)
-            if analysis["status"] == "no_sources":
-                response = "Пока нет подключённых источников для анализа. Подключите почту или добавьте бота в рабочий чат."
-                markup = {"inline_keyboard": [[
-                    {"text": "Подключить источник", "callback_data": UIActionService(db).create(user, "source_connect_menu", {})}
-                ]]}
-            else:
-                response = f"Анализ запущен для сообщений: {analysis['queued']}"
-                if analysis.get("external_sync") == "queued":
-                    response += "\nСинхронизация почты запущена в фоне."
-                elif analysis.get("external_sync") == "broker_unavailable":
-                    response += "\nОчередь синхронизации почты недоступна."
+            response = (
+                "Пока нет подключённых источников для анализа."
+                if analysis["status"] == "no_sources"
+                else f"Анализ запущен для сообщений: {analysis['queued']}"
+            )
+            if analysis.get("external_sync") == "queued":
+                response += "\nСинхронизация почты запущена в фоне."
+            elif analysis.get("external_sync") == "broker_unavailable":
+                response += "\nОчередь синхронизации почты недоступна."
         elif sec in {"tasks", "projects", "inbox", "sources", "settings"}:
             response, markup = section_view(db, user, sec)
         else:
