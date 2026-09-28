@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     internal_api_token: str = "change-me"
     telegram_bot_token: str = ""
     telegram_webhook_secret: str = "change-me"
-    telegram_mode: str = "polling"
+    telegram_polling: bool = True
     llm_provider: str = "local"
     llm_api_key: str = ""
     llm_model: str = "local-rules"
@@ -58,7 +58,7 @@ class Settings(BaseSettings):
                 "ENCRYPTION_KEY": not self.encryption_key,
                 "TELEGRAM_BOT_TOKEN": not self.telegram_bot_token,
             }
-            if self.telegram_mode.lower() == "webhook":
+            if not self.telegram_polling:
                 insecure["TELEGRAM_WEBHOOK_SECRET"] = self.telegram_webhook_secret in {"", "change-me"}
             missing = [name for name, bad in insecure.items() if bad]
             if missing:

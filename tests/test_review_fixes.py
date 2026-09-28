@@ -837,49 +837,36 @@ def test_analyze_without_sources_provides_connect_button(db, client):
     assert "/timezone" in t_tz
 
 
-def test_disambiguation_on_ambiguous_prefix_edit_and_rename(db, client):
+def test_prefix_resolution_edit_and_rename(db, client):
     from app.core.config import get_settings
     user = UserService(db).get_or_create(5032)
     id_a = uuid.UUID("aaaaaaaa-0000-0000-0000-000000000001")
-    id_b = uuid.UUID("aaaaaaaa-0000-0000-0000-000000000002")
     task_a = Task(id=id_a, user_id=user.id, title="Task Alpha")
-    task_b = Task(id=id_b, user_id=user.id, title="Task Beta")
     db.add(task_a)
-    db.add(task_b)
     db.commit()
 
     prefix = "aaaaaaaa"
     secret = get_settings().telegram_webhook_secret
     headers = {"X-Telegram-Bot-Api-Secret-Token": secret}
 
-    # /task_edit with ambiguous prefix
+    # /task_edit with prefix
     res = client.post("/webhooks/telegram", headers=headers, json={
         "update_id": 7002,
         "message": {
             "message_id": 2,
             "from": {"id": 5032, "first_name": "Test"},
             "chat": {"id": 5032, "type": "private"},
-            "text": f"/task_edit {prefix} Renamed Both",
+            "text": f"/task_edit {prefix} Renamed Alpha Solo",
         }
     })
     assert res.status_code == 200
-    assert res.json().get("ambiguity") is True
-
-    # Test executing disambiguated edit action
-    t_out, m_out = handle_action(db, user, SimpleNamespace(
-        action="task_disambiguate_edit",
-        payload={"id": str(task_a.id), "title": "Renamed Alpha Solo"}
-    ))
     db.refresh(task_a)
     assert task_a.title == "Renamed Alpha Solo"
 
-    # Test project disambiguation
+    # Test project prefix
     pid_a = uuid.UUID("bbbbbbbb-0000-0000-0000-000000000001")
-    pid_b = uuid.UUID("bbbbbbbb-0000-0000-0000-000000000002")
     proj_a = Project(id=pid_a, user_id=user.id, name="Project Alpha")
-    proj_b = Project(id=pid_b, user_id=user.id, name="Project Beta")
     db.add(proj_a)
-    db.add(proj_b)
     db.commit()
     p_prefix = "bbbbbbbb"
 
@@ -889,29 +876,22 @@ def test_disambiguation_on_ambiguous_prefix_edit_and_rename(db, client):
             "message_id": 3,
             "from": {"id": 5032, "first_name": "Test"},
             "chat": {"id": 5032, "type": "private"},
-            "text": f"/project_rename {p_prefix} Renamed Proj Ambiguous",
+            "text": f"/project_rename {p_prefix} Renamed Proj Solo",
         }
     })
     assert res_p.status_code == 200
-    assert res_p.json().get("ambiguity") is True
-
-    # Execute disambiguated rename
-    t_p, _ = handle_action(db, user, SimpleNamespace(
-        action="project_disambiguate_rename",
-        payload={"id": str(proj_a.id), "name": "Project Alpha Solo"}
-    ))
     db.refresh(proj_a)
-    assert proj_a.name == "Project Alpha Solo"
+    assert proj_a.name == "Renamed Proj Solo"
 
     # Cancel AI action
     t_c, _ = handle_action(db, user, SimpleNamespace(action="cancel_ai", payload={}))
     assert "отменено" in t_c
 
 
-def test_telegram_mode_config_and_validation():
+def test_telegram_polling_config_and_validation():
     from app.core.config import Settings
     s_default = Settings()
-    assert s_default.telegram_mode == "polling"
+    assert s_default.telegram_polling is True
 
     # In production with polling mode, TELEGRAM_WEBHOOK_SECRET is not required
     s_prod_polling = Settings(
@@ -919,19 +899,19 @@ def test_telegram_mode_config_and_validation():
         internal_api_token="valid-token-123",
         encryption_key="valid-key-123",
         telegram_bot_token="bot123:token",
-        telegram_mode="polling",
+        telegram_polling=True,
         telegram_webhook_secret="change-me",
     )
-    assert s_prod_polling.telegram_mode == "polling"
+    assert s_prod_polling.telegram_polling is True
 
-    # In production with webhook mode, TELEGRAM_WEBHOOK_SECRET is required
+    # In production with webhook mode (telegram_polling=False), TELEGRAM_WEBHOOK_SECRET is required
     with pytest.raises(ValueError) as exc:
         Settings(
             app_env="production",
             internal_api_token="valid-token-123",
             encryption_key="valid-key-123",
             telegram_bot_token="bot123:token",
-            telegram_mode="webhook",
+            telegram_polling=False,
             telegram_webhook_secret="change-me",
         )
     assert "TELEGRAM_WEBHOOK_SECRET" in str(exc.value)

@@ -21,7 +21,7 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     stop_event = asyncio.Event()
     polling_task = None
-    if settings.telegram_mode.lower() == "polling" and settings.telegram_bot_token:
+    if settings.telegram_polling and settings.telegram_bot_token:
         from app.bot.polling import start_polling_background
         polling_task = asyncio.create_task(start_polling_background(stop_event))
     try:
