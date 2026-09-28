@@ -1,8 +1,17 @@
+import os
+
+# Ensure tests run in a hermetic environment without live external Telegram calls
+os.environ["TELEGRAM_BOT_TOKEN"] = ""
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
+
+from app.core.config import get_settings
+
+get_settings.cache_clear()
 
 import app.models  # noqa: F401
 from app.core.security import issue_user_token
