@@ -16,10 +16,10 @@ class TelegramClient:
             self.token = get_settings().telegram_bot_token
         self.base_url = f"https://api.telegram.org/bot{self.token}"
 
-    def _call(self, method: str, payload: dict):
+    def _call(self, method: str, payload: dict, timeout: float = 15.0):
         if not self.token:
             return None
-        response = httpx.post(f"{self.base_url}/{method}", json=payload, timeout=10)
+        response = httpx.post(f"{self.base_url}/{method}", json=payload, timeout=timeout)
         response.raise_for_status()
         body = response.json()
         return body.get("result") if body.get("ok") else None
@@ -64,7 +64,7 @@ class TelegramClient:
         return bytes(chunks)
 
     def get_updates(
-        self, offset: int | None = None, timeout: int = 30, limit: int = 100
+        self, offset: int | None = None, timeout: int = 10, limit: int = 100
     ) -> list[dict]:
         payload: dict = {
             "timeout": timeout,
@@ -73,8 +73,11 @@ class TelegramClient:
         }
         if offset is not None:
             payload["offset"] = offset
-        res = self._call("getUpdates", payload)
-        return res if isinstance(res, list) else []
+        try:
+            res = self._call("getUpdates", payload, timeout=float(timeout) + 5.0)
+            return res if isinstance(res, list) else []
+        except httpx.TimeoutException:
+            return []
 
     def delete_webhook(self, drop_pending_updates: bool = False) -> bool:
         res = self._call("deleteWebhook", {"drop_pending_updates": drop_pending_updates})

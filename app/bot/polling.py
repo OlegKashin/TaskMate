@@ -18,7 +18,7 @@ def poll_once(
     client: TelegramClient,
     db: Session,
     offset: int | None = None,
-    timeout: int = 30,
+    timeout: int = 10,
 ) -> tuple[int | None, list[dict[str, Any]]]:
     updates = client.get_updates(offset=offset, timeout=timeout)
     results = []
