@@ -307,6 +307,28 @@ def process_telegram_update(db: Session, payload: dict) -> dict:
             return {"ok": True, "undone": str(task.id)}
         if action.action == "navigate":
             section = action.payload["section"]
+            if section == "menu":
+                action_service = UIActionService(db)
+                tokens = {
+                    sec: action_service.create(
+                        user, "navigate", {"section": sec}, ttl_seconds=86400
+                    )
+                    for sec in (
+                        "today",
+                        "tasks",
+                        "projects",
+                        "inbox",
+                        "sources",
+                        "schedule",
+                        "settings",
+                    )
+                }
+                client.send_message(
+                    chat_id, "TaskMate AI готов. Выберите раздел:", main_menu(tokens)
+                )
+                client.answer_callback(callback.get("id"))
+                db.commit()
+                return {"ok": True, "section": "menu"}
             section_text, section_markup = section_view(db, user, section)
             if section == "sources" and callback_message.get("chat", {}).get("type") == "private":
                 connect_rows = email_connect_menu(db, user)["inline_keyboard"]

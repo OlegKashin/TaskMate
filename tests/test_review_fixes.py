@@ -285,7 +285,7 @@ def test_bot_inbox_navigation_and_snooze(client, db, monkeypatch):
     })
     assert start.status_code == 200
     menu = sent.call_args.args[2]["inline_keyboard"]
-    inbox_token = next(button["callback_data"] for row in menu for button in row if button["text"] == "Inbox")
+    inbox_token = next(button["callback_data"] for row in menu for button in row if button["text"] in {"Inbox", "📥 Входящие на разбор"})
     assert callback(50052, inbox_token).status_code == 200
     inbox_token = sent.call_args.args[2]["inline_keyboard"][0][0]["callback_data"]
     assert callback(50053, inbox_token).status_code == 200

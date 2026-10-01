@@ -114,7 +114,7 @@ def test_task_validation_project_and_not_found(client, headers):
 
 
 def test_today_stats_and_analyze_stub(client, headers):
-    due = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+    due = datetime.now(UTC).isoformat()
     data(client.post("/api/v1/tasks", headers=headers, json={"title": "Today", "due_at": due}), 201)
     assert len(data(client.get("/api/v1/today", headers=headers))["tasks"]) == 1
     assert data(client.get("/api/v1/stats", headers=headers))["tasks"] == 1

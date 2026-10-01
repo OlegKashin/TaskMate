@@ -142,7 +142,7 @@ def section_message(db: Session, user: User, section: str) -> str:
             Task.user_id == user.id, Task.deleted_at.is_(None),
             Task.status.not_in(["completed", "cancelled"]), Task.due_at < start,
         )) or 0
-        lines = ["☀️ Сегодня"]
+        lines = ["☀️ План на сегодня"]
         lines.extend(f"{local_time(event.start_at, zone):%H:%M} — {event.title}" for event in events)
         for task in tasks:
             icon = "🔴 " if task.priority == "high" else ""
@@ -169,7 +169,7 @@ def section_message(db: Session, user: User, section: str) -> str:
         return f"🌙 Итоги дня\nСоздано задач: {created}\nВыполнено: {completed}\nЗавтра: {tomorrow} задач"
     if section == "settings":
         settings = db.get(UserSettings, user.id)
-        return (f"⚙️ Настройки\nЧасовой пояс: {user.timezone}\n"
+        return (f"⚙️ Настройки и интеграции\nЧасовой пояс: {user.timezone}\n"
                 f"Утренняя сводка: {'вкл' if settings.morning_briefing_enabled else 'выкл'}, {settings.morning_briefing_time:%H:%M}\n"
                 f"Вечерняя статистика: {'вкл' if settings.evening_stats_enabled else 'выкл'}, {settings.evening_stats_time:%H:%M}")
     model = {"tasks": Task, "projects": Project, "inbox": InboxItem, "sources": Source}.get(section)
@@ -185,7 +185,12 @@ def section_message(db: Session, user: User, section: str) -> str:
                 )
             )
         items = db.scalars(select(model).where(*conditions).limit(10)).all()
-        heading = {"tasks": "Задачи", "projects": "Проекты", "inbox": "Inbox", "sources": "Источники"}[section]
+        heading = {
+            "tasks": "📋 Задачи и проекты",
+            "projects": "📁 Проекты",
+            "inbox": "📥 Входящие на разбор",
+            "sources": "🔗 Источники",
+        }[section]
         return f"{heading}\n" + ("\n".join(
             f"• {getattr(item, 'title', None) or getattr(item, 'name', None) or getattr(item, 'summary', None) or item.id}" for item in items
         ) or "Пока пусто.")

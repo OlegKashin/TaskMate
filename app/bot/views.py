@@ -26,14 +26,21 @@ def _button(db, user, label: str, action: str, payload: dict) -> dict:
 
 def section_view(db, user, section: str) -> tuple[str, dict | None]:
     text = section_message(db, user, section)
+    if section == "today":
+        rows = [
+            [_button(db, user, "« Главное меню", "navigate", {"section": "menu"})],
+        ]
+        return text, {"inline_keyboard": rows}
     if section == "settings":
         settings = db.get(UserSettings, user.id)
         rows = [
+            [_button(db, user, "🔗 Источники (Email, Telegram)", "navigate", {"section": "sources"})],
             [_button(db, user, "Изменить часовой пояс", "setting_timezone", {})],
             [_button(db, user, "Утренняя сводка вкл/выкл", "setting_toggle", {"field": "morning_briefing_enabled"})],
             [_button(db, user, "Вечерняя статистика вкл/выкл", "setting_toggle", {"field": "evening_stats_enabled"})],
             [_button(db, user, "Время сводок", "setting_times", {})],
             [_button(db, user, "Проект по умолчанию", "setting_projects", {})],
+            [_button(db, user, "« Главное меню", "navigate", {"section": "menu"})],
         ]
         default_project = db.get(Project, settings.default_project_id) if settings.default_project_id else None
         text += (f"\nПроект по умолчанию: {default_project.name if default_project else 'Inbox'}"
@@ -61,11 +68,21 @@ def section_view(db, user, section: str) -> tuple[str, dict | None]:
     rows = [[_button(db, user, str(getattr(item, "title", None) or getattr(item, "name", None) or item.id)[:40],
                      f"{section}_open", {"id": str(item.id)})] for item in items]
     if section == "tasks":
-        rows.insert(0, [_button(db, user, "Создать задачу", "task_new_prompt", {})])
+        rows.insert(0, [
+            _button(db, user, "Создать задачу", "task_new_prompt", {}),
+            _button(db, user, "📁 Проекты", "navigate", {"section": "projects"}),
+        ])
     if section == "projects":
-        rows.insert(0, [_button(db, user, "Создать проект", "project_new_prompt", {})])
+        rows.insert(0, [
+            _button(db, user, "Создать проект", "project_new_prompt", {}),
+            _button(db, user, "📋 К задачам", "navigate", {"section": "tasks"}),
+        ])
     if section == "sources":
-        rows.insert(0, [_button(db, user, "Подключить источник", "source_connect_menu", {})])
+        rows.insert(0, [
+            _button(db, user, "Подключить источник", "source_connect_menu", {}),
+            _button(db, user, "⚙️ В настройки", "navigate", {"section": "settings"}),
+        ])
+    rows.append([_button(db, user, "« Главное меню", "navigate", {"section": "menu"})])
     return text, {"inline_keyboard": rows} if rows else None
 
 

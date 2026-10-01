@@ -98,17 +98,16 @@ def main_menu(tokens: dict[str, str]):
     return {
         "inline_keyboard": [
             [
-                {"text": "Сегодня", "callback_data": tokens["today"]},
-                {"text": "Задачи", "callback_data": tokens["tasks"]},
+                {"text": "📅 План на сегодня", "callback_data": tokens["today"]},
+                {"text": "📥 Входящие на разбор", "callback_data": tokens["inbox"]},
             ],
             [
-                {"text": "Проекты", "callback_data": tokens["projects"]},
-                {"text": "Inbox", "callback_data": tokens["inbox"]},
+                {"text": "📋 Задачи и проекты", "callback_data": tokens["tasks"]},
+                {"text": "📆 Расписание встреч", "callback_data": tokens["schedule"]},
             ],
             [
-                {"text": "Источники", "callback_data": tokens["sources"]},
-                {"text": "Календарь", "callback_data": tokens["schedule"]},
+                {"text": "⚙️ Настройки и интеграции", "callback_data": tokens["settings"]},
             ],
-            [{"text": "Настройки", "callback_data": tokens["settings"]}],
         ]
     }
+
