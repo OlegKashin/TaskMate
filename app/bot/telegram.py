@@ -180,7 +180,7 @@ def process_telegram_update(db: Session, payload: dict) -> dict:
             return {"ok": True, "ignored": True, "reason": "private_action"}
         if action.action in ACTIONS:
             text, markup = handle_action(db, user, action)
-            if message_id:
+            if message_id and not (markup and "keyboard" in markup):
                 client.edit_message(chat_id, message_id, text, markup)
             else:
                 client.send_message(chat_id, text, markup)
@@ -460,6 +460,33 @@ def process_telegram_update(db: Session, payload: dict) -> dict:
         last_name=sender.get("last_name"),
     )
     chat_id = chat.get("id", tg_id)
+    if "location" in message_data and chat.get("type") == "private":
+        loc = message_data["location"]
+        lat = float(loc.get("latitude", 0))
+        lon = float(loc.get("longitude", 0))
+        from app.core.timezones import find_timezone_by_coordinates, get_timezone_display
+        detected_tz = find_timezone_by_coordinates(lat, lon)
+        user.timezone = detected_tz
+        db.commit()
+        try:
+            now_local = datetime.now(ZoneInfo(detected_tz))
+            time_str = now_local.strftime("%H:%M")
+        except Exception:
+            time_str = "--:--"
+        disp = get_timezone_display(detected_tz)
+        reply_text = (
+            f"📍 Ваше местоположение определено!\n\n"
+            f"Установлен часовой пояс: <b>{disp}</b> ({detected_tz})\n"
+            f"Текущее местное время: <b>{time_str}</b>"
+        )
+        TelegramClient().send_message(chat_id, reply_text, {"remove_keyboard": True})
+        return {"ok": True, "location_timezone": detected_tz}
+
+    if (message_data.get("text") or "").strip() == "❌ Отмена" and chat.get("type") == "private":
+        TelegramClient().send_message(chat_id, "Определение часового пояса отменено.", {"remove_keyboard": True})
+        db.commit()
+        return {"ok": True, "location_cancelled": True}
+
     command = (message_data.get("text") or "").split(maxsplit=1)[0].lower()
     command = command.split("@", 1)[0]
     if command == "/connect" and chat.get("type") == "private":
@@ -623,17 +650,18 @@ def process_telegram_update(db: Session, payload: dict) -> dict:
             pass
         return {"ok": True, "clarification": True, "job_id": str(job.id)}
     if command == "/timezone" and chat.get("type") == "private":
+        from app.core.timezones import get_timezone_display, resolve_timezone
         parts = (message_data.get("text") or "").split(maxsplit=1)
         if len(parts) != 2:
-            response = "Укажите часовой пояс: /timezone Europe/Moscow"
+            response = "Укажите часовой пояс: /timezone Europe/Moscow\nИли город: /timezone Екатеринбург"
         else:
-            try:
-                ZoneInfo(parts[1].strip())
-            except ZoneInfoNotFoundError:
+            resolved = resolve_timezone(parts[1])
+            if not resolved:
                 response = "Неизвестный часовой пояс. Например: /timezone Europe/Moscow"
             else:
-                user.timezone = parts[1].strip()
-                response = f"Часовой пояс установлен: {user.timezone}"
+                user.timezone = resolved
+                display = get_timezone_display(resolved)
+                response = f"Часовой пояс установлен: {display} ({user.timezone})"
         TelegramClient().send_message(chat_id, response)
         db.commit()
         return {"ok": True, "command": "timezone"}

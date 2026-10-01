@@ -1,7 +1,8 @@
 """User-facing callback operations; domain services remain the source of truth."""
 
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
@@ -46,6 +47,7 @@ ACTIONS = {
     "task_snooze", "task_add_calendar", "source_setting_toggle",
     "waiting_open", "waiting_complete", "waiting_cancel", "reminder_cancel",
     "cancel_ai", "edit_ai", "source_connect_menu", "setting_timezone",
+    "setting_set_timezone", "setting_request_location",
     "task_disambiguate_edit", "project_disambiguate_rename",
 }
 
@@ -308,8 +310,44 @@ def handle_action(db, user, action) -> tuple[str, dict | None]:
     if kind == "edit_ai":
         return "Отправьте уточнённое сообщение с изменениями.", None
     if kind == "setting_timezone":
-        return ("Укажите часовой пояс: /timezone Europe/Moscow\n"
-                "Или укажите ваш город/регион, например /timezone Asia/Yekaterinburg"), None
+        from app.core.timezones import get_timezone_display, timezone_picker_menu
+        disp = get_timezone_display(user.timezone or "UTC")
+        text = (
+            f"🌍 <b>Настройка часового пояса</b>\n\n"
+            f"Текущий часовой пояс: <b>{disp}</b> ({user.timezone or 'UTC'})\n\n"
+            "Выберите ваш город или регион из списка ниже, определите по геолокации или введите команду:\n"
+            "<code>/timezone &lt;город или регион&gt;</code> (например, <code>/timezone Самара</code>)"
+        )
+        return text, timezone_picker_menu(db, user)
+    if kind == "setting_set_timezone":
+        new_tz = payload.get("timezone", "UTC")
+        user.timezone = new_tz
+        db.commit()
+        from app.core.timezones import get_timezone_display
+        try:
+            now_local = datetime.now(ZoneInfo(new_tz))
+            time_str = now_local.strftime("%H:%M")
+        except Exception:
+            time_str = "--:--"
+        disp = get_timezone_display(new_tz)
+        msg, kb = section_view(db, user, "settings")
+        text = f"✅ Часовой пояс изменён на <b>{disp}</b> ({new_tz})\nТекущее местное время: <b>{time_str}</b>\n\n{msg}"
+        return text, kb
+    if kind == "setting_request_location":
+        markup = {
+            "keyboard": [
+                [{"text": "📍 Отправить моё местоположение", "request_location": True}],
+                [{"text": "❌ Отмена"}],
+            ],
+            "resize_keyboard": True,
+            "one_time_keyboard": True,
+        }
+        text = (
+            "📍 Нажмите кнопку ниже <b>«Отправить моё местоположение»</b>, "
+            "чтобы определить ваш часовой пояс автоматически.\n\n"
+            "<i>(Координаты используются только для выбора часового пояса и не сохраняются)</i>"
+        )
+        return text, markup
     if kind == "source_connect_menu":
         from app.bot.telegram import email_connect_menu
         return "Подключить почту или календарь:", email_connect_menu(db, user)
