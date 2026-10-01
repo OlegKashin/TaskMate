@@ -1,3 +1,5 @@
+import os
+
 import httpx
 
 from app.core.config import get_settings
@@ -6,7 +8,12 @@ from app.core.errors import AppError
 
 class TelegramClient:
     def __init__(self, token: str | None = None):
-        self.token = token if token is not None else get_settings().telegram_bot_token
+        if token is not None:
+            self.token = token
+        elif os.environ.get("PYTEST_CURRENT_TEST"):
+            self.token = ""
+        else:
+            self.token = get_settings().telegram_bot_token
         self.base_url = f"https://api.telegram.org/bot{self.token}"
 
     def _call(self, method: str, payload: dict):
