@@ -188,7 +188,7 @@ def section_message(db: Session, user: User, section: str) -> str:
         heading = {
             "tasks": "📋 Задачи и проекты",
             "projects": "📁 Проекты",
-            "inbox": "📥 Входящие на разбор",
+            "inbox": "📥 Предложения AI",
             "sources": "🔗 Источники",
         }[section]
         return f"{heading}\n" + ("\n".join(

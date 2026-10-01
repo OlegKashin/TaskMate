@@ -99,7 +99,7 @@ def main_menu(tokens: dict[str, str]):
         "inline_keyboard": [
             [
                 {"text": "📅 План на сегодня", "callback_data": tokens["today"]},
-                {"text": "📥 Входящие на разбор", "callback_data": tokens["inbox"]},
+                {"text": "📥 Предложения AI", "callback_data": tokens["inbox"]},
             ],
             [
                 {"text": "📋 Задачи и проекты", "callback_data": tokens["tasks"]},
