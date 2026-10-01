@@ -9,8 +9,8 @@ class Settings(BaseSettings):
 
     app_env: str = "development"
     app_host: str = "0.0.0.0"
-    app_port: int = 8000
-    public_base_url: str = "http://localhost:8000"
+    app_port: int = 8001
+    public_base_url: str = "http://localhost:8001"
     database_url: str = "sqlite:///./taskmate.db"
     redis_url: str = "redis://localhost:6379/0"
     internal_api_token: str = "change-me"
