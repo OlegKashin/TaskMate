@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     stt_provider: str = "disabled"
     stt_api_key: str = ""
     stt_model: str = "gpt-transcribe"
-    s3_endpoint: str = "http://localhost:9000"
+    s3_endpoint: str = "http://localhost:8333"
     s3_bucket: str = "taskmate"
     s3_access_key: str = "taskmate"
     s3_secret_key: str = "taskmate-local-secret"
