@@ -1,11 +1,13 @@
 """Small Telegram cards backed by short-lived, owner-bound callback actions."""
 
 import uuid
+from datetime import UTC, datetime
 
 from sqlalchemy import and_, or_, select
 
 from app.ai.service import MUTATING_INTENTS
 from app.bot.presentation import local_time, section_message
+from app.core.config import get_settings
 from app.models.entities import (
     AIProcessingJob,
     CalendarEvent,
@@ -42,6 +44,8 @@ def section_view(db, user, section: str) -> tuple[str, dict | None]:
             [_button(db, user, "Проект по умолчанию", "setting_projects", {})],
             [_button(db, user, "« Главное меню", "navigate", {"section": "menu"})],
         ]
+        if user.telegram_user_id in get_settings().get_admin_user_ids():
+            rows.insert(0, [_button(db, user, "📊 Метрики сервиса (Admin)", "admin_metrics_view", {"date": datetime.now(UTC).strftime("%Y-%m-%d")})])
         default_project = db.get(Project, settings.default_project_id) if settings.default_project_id else None
         text += (f"\nПроект по умолчанию: {default_project.name if default_project else 'Inbox'}"
                  "\nЧасовой пояс: /timezone Europe/Moscow")

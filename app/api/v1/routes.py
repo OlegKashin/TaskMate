@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
+from app.core.config import get_settings
 from app.core.errors import AppError, not_found
 from app.integrations.storage import S3Storage
 from app.models.entities import (
@@ -522,3 +523,14 @@ def _user_day_bounds(timezone: str) -> tuple[datetime, datetime]:
         zone = ZoneInfo("UTC")
     start = datetime.now(zone).replace(hour=0, minute=0, second=0, microsecond=0)
     return start.astimezone(UTC), (start + timedelta(days=1)).astimezone(UTC)
+
+
+@router.get("/metrics/summary")
+def get_metrics_summary(user: CurrentUser, date: str | None = None):
+    admin_ids = get_settings().get_admin_user_ids()
+    if admin_ids and user.telegram_user_id not in admin_ids:
+        raise AppError("FORBIDDEN", "Admin privileges required", 403)
+    from app.services.metrics import MetricsService
+
+    summary = MetricsService().get_summary(target_date=date)
+    return ok(summary)

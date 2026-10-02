@@ -113,4 +113,9 @@ class OpenAIProvider:
                 raise ValueError("LLM returned no JSON text")
             return AIResult.model_validate_json(raw_text)
         except (httpx.HTTPError, ValueError) as exc:
+            try:
+                from app.services.metrics import MetricsService
+                MetricsService().track_error("llm", "llm_error")
+            except Exception:
+                pass
             raise AppError("LLM_REQUEST_FAILED", "AI interpretation failed", 502) from exc

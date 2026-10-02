@@ -53,6 +53,11 @@ class VoiceTranscriber:
                 else:
                     text = str(payload_json).strip()
         except (httpx.HTTPError, ValueError, KeyError) as exc:
+            try:
+                from app.services.metrics import MetricsService
+                MetricsService().track_error("stt", "stt_error")
+            except Exception:
+                pass
             raise AppError("STT_REQUEST_FAILED", "Voice transcription failed", 502) from exc
         if not text:
             raise AppError("STT_EMPTY", "No speech was recognized", 422)

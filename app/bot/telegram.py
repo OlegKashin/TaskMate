@@ -1,5 +1,5 @@
 import uuid
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Header
@@ -40,6 +40,7 @@ from app.services.domain import (
     utcnow,
 )
 from app.services.email import EmailService
+from app.services.metrics import MetricsService
 from app.services.oauth import OAuthService
 
 router = APIRouter()
@@ -159,6 +160,7 @@ def process_telegram_update(db: Session, payload: dict) -> dict:
         if not isinstance(tg_id, int):
             raise AppError("VALIDATION_ERROR", "callback sender is required", 422)
         user = UserService(db).get_or_create(tg_id)
+        MetricsService().track_interaction(user.telegram_user_id, "buttons")
         client = TelegramClient()
         try:
             action = UIActionService(db).consume(user, callback.get("data", ""))
@@ -214,6 +216,39 @@ def process_telegram_update(db: Session, payload: dict) -> dict:
             client.answer_callback(callback.get("id"))
             db.commit()
             return {"ok": True, "action": action.action}
+        if action.action == "admin_metrics_view":
+            if user.telegram_user_id not in get_settings().get_admin_user_ids():
+                client.answer_callback(callback.get("id"), "Доступ разрешен только администраторам")
+                db.commit()
+                return {"ok": True, "forbidden": True}
+            target_date = action.payload.get("date")
+            summary = MetricsService().get_summary(target_date=target_date)
+            text = MetricsService.format_metrics_text(summary)
+            today_str = datetime.now(UTC).strftime("%Y-%m-%d")
+            yesterday_str = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+            today_act = UIActionService(db).create(user, "admin_metrics_view", {"date": today_str})
+            yesterday_act = UIActionService(db).create(user, "admin_metrics_view", {"date": yesterday_str})
+            refresh_act = UIActionService(db).create(user, "admin_metrics_view", {"date": summary["date"]})
+            back_act = UIActionService(db).create(user, "navigate", {"section": "settings"})
+            markup = {
+                "inline_keyboard": [
+                    [
+                        {"text": "📅 Сегодня", "callback_data": today_act},
+                        {"text": "📅 Вчера", "callback_data": yesterday_act},
+                    ],
+                    [
+                        {"text": "🔄 Обновить", "callback_data": refresh_act},
+                        {"text": "« Назад", "callback_data": back_act},
+                    ],
+                ]
+            }
+            if message_id:
+                client.edit_message(chat_id, message_id, text, markup)
+            else:
+                client.send_message(chat_id, text, markup)
+            client.answer_callback(callback.get("id"))
+            db.commit()
+            return {"ok": True, "action": "admin_metrics_view"}
         if action.action == "project_choice_other":
             projects = db.scalars(select(Project).where(
                 Project.user_id == user.id, Project.is_archived.is_(False),
@@ -460,6 +495,14 @@ def process_telegram_update(db: Session, payload: dict) -> dict:
         last_name=sender.get("last_name"),
     )
     chat_id = chat.get("id", tg_id)
+    if "voice" in message_data:
+        act_type = "voice_messages"
+    elif (message_data.get("text") or "").startswith("/"):
+        act_type = "commands"
+    else:
+        act_type = "text_messages"
+    MetricsService().track_interaction(user.telegram_user_id, act_type)
+
     if "location" in message_data and chat.get("type") == "private":
         loc = message_data["location"]
         try:
@@ -492,8 +535,33 @@ def process_telegram_update(db: Session, payload: dict) -> dict:
         db.commit()
         return {"ok": True, "location_cancelled": True}
 
-    command = (message_data.get("text") or "").split(maxsplit=1)[0].lower()
-    command = command.split("@", 1)[0]
+    text_parts = (message_data.get("text") or "").split(maxsplit=1)
+    command = text_parts[0].lower().split("@", 1)[0] if text_parts else ""
+    if command in {"/metrics", "/stats"} and chat.get("type") == "private":
+        if user.telegram_user_id not in get_settings().get_admin_user_ids():
+            db.commit()
+            return {"ok": True, "command": "unknown"}
+        summary = MetricsService().get_summary()
+        text = MetricsService.format_metrics_text(summary)
+        today_str = datetime.now(UTC).strftime("%Y-%m-%d")
+        yesterday_str = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+        today_act = UIActionService(db).create(user, "admin_metrics_view", {"date": today_str})
+        yesterday_act = UIActionService(db).create(user, "admin_metrics_view", {"date": yesterday_str})
+        refresh_act = UIActionService(db).create(user, "admin_metrics_view", {"date": summary["date"]})
+        markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "📅 Сегодня", "callback_data": today_act},
+                    {"text": "📅 Вчера", "callback_data": yesterday_act},
+                ],
+                [
+                    {"text": "🔄 Обновить", "callback_data": refresh_act},
+                ],
+            ]
+        }
+        TelegramClient().send_message(chat_id, text, markup)
+        db.commit()
+        return {"ok": True, "command": "metrics"}
     if command == "/connect" and chat.get("type") == "private":
         TelegramClient().send_message(chat_id, "Подключить почту или календарь:", email_connect_menu(db, user))
         db.commit()

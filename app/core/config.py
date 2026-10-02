@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_webhook_secret: str = "change-me"
     telegram_polling: bool = True
+    telegram_admin_ids: str = ""
     base_url: str = "https://shared1.multitool.works:4000/v1"
     llm_provider: str = "openai"
     llm_api_key: str = "sk-BnXvhxy4QabPGM2ifcDXxw"
@@ -67,6 +68,15 @@ class Settings(BaseSettings):
             if missing:
                 raise ValueError(f"Production secrets must be configured: {', '.join(missing)}")
         return self
+
+    def get_admin_user_ids(self) -> set[int]:
+        if not self.telegram_admin_ids:
+            return set()
+        return {
+            int(item.strip())
+            for item in str(self.telegram_admin_ids).split(",")
+            if item.strip().isdigit()
+        }
 
 
 @lru_cache
