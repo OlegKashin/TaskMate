@@ -87,6 +87,7 @@ def test_find_timezone_by_coordinates():
 def test_get_timezone_display():
     assert "Москва" in get_timezone_display("Europe/Moscow")
     assert "Екатеринбург" in get_timezone_display("Asia/Yekaterinburg")
+    assert get_timezone_display("UTC") == "UTC (UTC+0)"
     assert get_timezone_display("Nonexistent/Zone") == "Nonexistent/Zone"
 
 
@@ -182,6 +183,35 @@ def test_telegram_location_update(db, client):
         assert args[0] == 9105
         assert "Екатеринбург" in args[1]
         assert args[2] == {"remove_keyboard": True}
+
+
+def test_telegram_location_invalid_coords(db, client):
+    user = UserService(db).get_or_create(9115, telegram_username="geo_bad_user")
+    secret = get_settings().telegram_webhook_secret
+    headers = {"X-Telegram-Bot-Api-Secret-Token": secret}
+
+    with patch("app.bot.telegram.TelegramClient.send_message") as mock_send:
+        res = client.post(
+            "/webhooks/telegram",
+            headers=headers,
+            json={
+                "update_id": 9915,
+                "message": {
+                    "message_id": 1015,
+                    "from": {"id": 9115, "username": "geo_bad_user"},
+                    "chat": {"id": 9115, "type": "private"},
+                    "date": 1727800000,
+                    "location": {
+                        "latitude": "invalid_lat",
+                        "longitude": "invalid_lon",
+                    },
+                },
+            },
+        )
+        assert res.status_code == 200
+        assert res.json().get("location_error") is True
+        mock_send.assert_called_once()
+        assert "Не удалось определить координаты" in mock_send.call_args[0][1]
 
 
 def test_telegram_location_cancel(db, client):

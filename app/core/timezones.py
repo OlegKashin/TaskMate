@@ -186,6 +186,8 @@ def find_timezone_by_coordinates(lat: float, lon: float) -> str:
 
 def get_timezone_display(tz_name: str) -> str:
     """Get a user-friendly display string for a timezone."""
+    if tz_name == "UTC":
+        return "UTC (UTC+0)"
     for _, _, tz, display, _ in CITIES_DB:
         if tz == tz_name:
             return display

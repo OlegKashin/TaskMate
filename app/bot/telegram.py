@@ -462,8 +462,13 @@ def process_telegram_update(db: Session, payload: dict) -> dict:
     chat_id = chat.get("id", tg_id)
     if "location" in message_data and chat.get("type") == "private":
         loc = message_data["location"]
-        lat = float(loc.get("latitude", 0))
-        lon = float(loc.get("longitude", 0))
+        try:
+            lat = float(loc.get("latitude", 0))
+            lon = float(loc.get("longitude", 0))
+        except (ValueError, TypeError):
+            TelegramClient().send_message(chat_id, "Не удалось определить координаты.", {"remove_keyboard": True})
+            db.commit()
+            return {"ok": True, "location_error": True}
         from app.core.timezones import find_timezone_by_coordinates, get_timezone_display
         detected_tz = find_timezone_by_coordinates(lat, lon)
         user.timezone = detected_tz
