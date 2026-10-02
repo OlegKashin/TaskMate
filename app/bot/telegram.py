@@ -1,6 +1,6 @@
 import uuid
 from datetime import UTC, datetime, time
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Header
 from sqlalchemy import select

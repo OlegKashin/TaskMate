@@ -36,16 +36,22 @@ class VoiceTranscriber:
             raise AppError("VOICE_CONVERSION_FAILED", "Voice conversion failed", 502) from exc
         if not converted or len(converted) > 25 * 1024 * 1024:
             raise AppError("VOICE_TOO_LARGE", "Converted voice exceeds limits", 413)
+        base_url = (settings.stt_base_url or settings.base_url or settings.llm_base_url or "https://api.openai.com/v1").rstrip("/")
+        transcription_url = base_url if base_url.endswith("/audio/transcriptions") else f"{base_url}/audio/transcriptions"
         try:
             async with httpx.AsyncClient(timeout=settings.stt_timeout_seconds) as client:
                 response = await client.post(
-                    TRANSCRIPTION_URL,
+                    transcription_url,
                     headers={"Authorization": f"Bearer {api_key}"},
-                    data={"model": settings.stt_model},
+                    data={"model": settings.stt_model, "response_format": "json"},
                     files={"file": ("voice.wav", converted, "audio/wav")},
                 )
                 response.raise_for_status()
-                text = response.json()["text"].strip()
+                payload_json = response.json()
+                if isinstance(payload_json, dict):
+                    text = str(payload_json.get("text", "")).strip()
+                else:
+                    text = str(payload_json).strip()
         except (httpx.HTTPError, ValueError, KeyError) as exc:
             raise AppError("STT_REQUEST_FAILED", "Voice transcription failed", 502) from exc
         if not text:

@@ -1,8 +1,5 @@
-import uuid
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import patch
 
 from app.bot.actions import handle_action
 from app.core.config import get_settings
@@ -12,7 +9,6 @@ from app.core.timezones import (
     resolve_timezone,
     timezone_picker_menu,
 )
-from app.models.entities import UIAction
 from app.services.domain import UserService
 
 
@@ -186,7 +182,7 @@ def test_telegram_location_update(db, client):
 
 
 def test_telegram_location_invalid_coords(db, client):
-    user = UserService(db).get_or_create(9115, telegram_username="geo_bad_user")
+    UserService(db).get_or_create(9115, telegram_username="geo_bad_user")
     secret = get_settings().telegram_webhook_secret
     headers = {"X-Telegram-Bot-Api-Secret-Token": secret}
 
@@ -215,7 +211,7 @@ def test_telegram_location_invalid_coords(db, client):
 
 
 def test_telegram_location_cancel(db, client):
-    user = UserService(db).get_or_create(9106, telegram_username="geo_cancel_user")
+    UserService(db).get_or_create(9106, telegram_username="geo_cancel_user")
     secret = get_settings().telegram_webhook_secret
     headers = {"X-Telegram-Bot-Api-Secret-Token": secret}
 
@@ -275,7 +271,7 @@ def test_telegram_timezone_command_city_name(db, client):
 
 
 def test_telegram_timezone_command_unknown(db, client):
-    user = UserService(db).get_or_create(9108, telegram_username="cmd_tz_user2")
+    UserService(db).get_or_create(9108, telegram_username="cmd_tz_user2")
     secret = get_settings().telegram_webhook_secret
     headers = {"X-Telegram-Bot-Api-Secret-Token": secret}
 
@@ -300,7 +296,7 @@ def test_telegram_timezone_command_unknown(db, client):
 
 
 def test_telegram_timezone_command_no_args(db, client):
-    user = UserService(db).get_or_create(9109, telegram_username="cmd_tz_user3")
+    UserService(db).get_or_create(9109, telegram_username="cmd_tz_user3")
     secret = get_settings().telegram_webhook_secret
     headers = {"X-Telegram-Bot-Api-Secret-Token": secret}
 

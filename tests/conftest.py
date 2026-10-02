@@ -10,6 +10,17 @@ from app.db.session import Base, get_db
 from app.main import app
 
 
+@pytest.fixture(autouse=True)
+def default_test_settings(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "local")
+    monkeypatch.setenv("STT_PROVIDER", "disabled")
+    from app.core.config import get_settings
+
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
 @pytest.fixture()
 def db():
     engine = create_engine(
